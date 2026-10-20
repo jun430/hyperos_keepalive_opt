@@ -1,0 +1,20 @@
+# ============================================================
+# 澎湃内存管理优化 - system.prop（post-fs-data 早期加载）
+# 职责：lmkd 保守化 + 关闭小米主动回收 prop 层（开机静态兜底）
+# 运行时可调项由 daemon 每轮 resetprop 应用，此处是开机第一道防线
+# ============================================================
+
+# ---------- 1. lmkd 保守化（只杀纯缓存进程）----------
+# low 压力：adj>=1001 = 不杀任何（adj 最大 1000）
+ro.lmk.low=1001
+# medium 压力：adj>=950（只杀最轻缓存进程）
+ro.lmk.medium=950
+# critical 压力：adj>=900（只杀 CACHED_APP，不碰可见/感知/服务）
+ro.lmk.critical=900
+ro.lmk.use_psi=true
+
+# ---------- 2. 关闭小米主动回收（prop 层静态兜底）----------
+persist.sys.miui.unfairMemory.enable=false
+persist.sys.memory_standard.enable=false
+persist.sys.memory_standard.appheap.enable=false
+persist.sys.mimd.reclaim.enable=false

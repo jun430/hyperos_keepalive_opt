@@ -1,0 +1,894 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>澎湃内存管理</title>
+<style>
+/* ============ 设计 Token：跟随系统主题 ============ */
+:root{
+  /* 默认深色（无 JS 时兜底） */
+  --bg:#0b0f1a;
+  --bg-rgb:11,15,26;
+  --glass:rgba(255,255,255,0.03);
+  --glass-strong:rgba(255,255,255,0.05);
+  --glass-border:rgba(255,255,255,0.14);
+  --glass-highlight:rgba(255,255,255,0.10);
+  --txt:#e5e9f0;
+  --sub:#8b98ad;
+  --accent:#5b8cff;
+  --accent2:#7c5cff;
+  --green:#34d399;
+  --red:#f87171;
+  --amber:#fbbf24;
+  --cyan:#22d3ee;
+  --tab-bg:rgba(255,255,255,0.08);
+  --tab-active:rgba(255,255,255,0.16);
+  --shadow:0 8px 32px rgba(0,0,0,0.35);
+}
+/* 浅色主题 */
+[data-theme="light"]{
+  --bg:#eef1f6;
+  --bg-rgb:238,241,246;
+  --glass:rgba(255,255,255,0.10);
+  --glass-strong:rgba(255,255,255,0.16);
+  --glass-border:rgba(0,0,0,0.08);
+  --glass-highlight:rgba(255,255,255,0.4);
+  --txt:#1a1d24;
+  --sub:#6b7280;
+  --accent:#3b6ef5;
+  --accent2:#6d4df0;
+  --green:#059669;
+  --red:#dc2626;
+  --amber:#d97706;
+  --cyan:#0891b2;
+  --tab-bg:rgba(255,255,255,0.6);
+  --tab-active:rgba(255,255,255,0.9);
+  --shadow:0 8px 32px rgba(0,0,0,0.12);
+}
+/* 深色主题 */
+[data-theme="dark"]{
+  --bg:#0b0f1a;
+  --bg-rgb:11,15,26;
+  --glass:rgba(255,255,255,0.03);
+  --glass-strong:rgba(255,255,255,0.05);
+  --glass-border:rgba(255,255,255,0.14);
+  --glass-highlight:rgba(255,255,255,0.10);
+  --txt:#e5e9f0;
+  --sub:#8b98ad;
+  --accent:#5b8cff;
+  --accent2:#7c5cff;
+  --green:#34d399;
+  --red:#f87171;
+  --amber:#fbbf24;
+  --cyan:#22d3ee;
+  --tab-bg:rgba(255,255,255,0.08);
+  --tab-active:rgba(255,255,255,0.16);
+  --shadow:0 8px 32px rgba(0,0,0,0.35);
+}
+/* 液态玻璃可调参数（JS 动态注入） */
+:root{
+  --glass-blur:12px;      /* 模糊度 */
+  --glass-opacity:1;      /* 玻璃透明度倍率 0~1 */
+}
+
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+
+body{
+  background:var(--bg);
+  color:var(--txt);
+  font-family:-apple-system,"PingFang SC","MiSans","HarmonyOS Sans",system-ui,sans-serif;
+  min-height:100vh; padding:0 0 120px; line-height:1.5;
+  transition:background .3s, color .3s;
+}
+/* 壁纸层 */
+body::before{
+  content:""; position:fixed; inset:0; z-index:-2;
+  background-image:var(--wallpaper, none);
+  background-size:cover; background-position:center;
+}
+/* 壁纸遮罩（轻遮罩，保证壁纸通透可辨） */
+body::after{
+  content:""; position:fixed; inset:0; z-index:-1;
+  background:linear-gradient(180deg, rgba(var(--bg-rgb),0.10), rgba(var(--bg-rgb),0.42));
+  transition:background .3s;
+}
+
+/* ============ 液态玻璃（真·液态质感） ============ */
+.glass{
+  position:relative;
+  background:var(--glass);
+  backdrop-filter:blur(var(--glass-blur)) saturate(1.8) brightness(1.05);
+  -webkit-backdrop-filter:blur(var(--glass-blur)) saturate(1.8) brightness(1.05);
+  border:1px solid var(--glass-border);
+  box-shadow:inset 0 1px 0 var(--glass-highlight),
+             inset 0 -1px 0 rgba(255,255,255,0.06),
+             inset 1px 0 0 rgba(255,255,255,0.04),
+             0 8px 32px rgba(0,0,0,0.18),
+             0 2px 8px rgba(0,0,0,0.08);
+  border-radius:18px;
+  overflow:hidden;
+}
+/* 液态高光：左上流动光斑（模拟玻璃折射，随透明度滑条消失） */
+.glass::before{
+  content:""; position:absolute; top:-40%; left:-20%;
+  width:70%; height:180%;
+  background:radial-gradient(ellipse at 30% 30%, rgba(255,255,255,0.06), transparent 60%);
+  transform:rotate(12deg);
+  pointer-events:none;
+  z-index:0;
+  opacity:var(--glass-opacity, 1);
+}
+/* 液态流光：底部弧形反光（随透明度滑条消失） */
+.glass::after{
+  content:""; position:absolute; bottom:-60%; right:-10%;
+  width:80%; height:120%;
+  background:radial-gradient(ellipse at 70% 70%, rgba(255,255,255,0.03), transparent 55%);
+  transform:rotate(-8deg);
+  pointer-events:none;
+  z-index:0;
+  opacity:var(--glass-opacity, 1);
+}
+/* 玻璃内容保护（文字在光斑之上） */
+.glass > *{ position:relative; z-index:1; }
+
+/* 顶栏 */
+header{
+  position:sticky; top:0; z-index:20;
+  padding:14px 16px; display:flex; align-items:center; justify-content:space-between;
+  margin:12px 14px 0; border-radius:18px;
+}
+.brand{display:flex;align-items:center;gap:12px}
+.logo{width:36px;height:36px;border-radius:11px;background:linear-gradient(135deg,var(--accent),var(--accent2));
+  display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:700;color:#fff;
+  box-shadow:0 4px 12px rgba(91,140,255,.35)}
+.brand h1{font-size:16px;font-weight:600}
+.brand small{display:block;font-size:10px;color:var(--sub);font-weight:400}
+.badge{font-size:11px;padding:4px 12px;border-radius:20px;background:rgba(52,211,153,.14);color:var(--green);border:1px solid rgba(52,211,153,.3)}
+.badge.game{background:rgba(251,191,36,.14);color:var(--amber);border-color:rgba(251,191,36,.3)}
+.badge.off{background:rgba(248,113,113,.14);color:var(--red);border-color:rgba(248,113,113,.3)}
+
+.wrap{max-width:680px;margin:0 auto;padding:0 14px}
+
+/* 仪表盘 */
+.dash{margin-top:14px;padding:20px}
+.dash .row{display:flex;gap:12px;margin-bottom:12px}
+.dash .row:last-child{margin-bottom:0}
+.metric{flex:1;background:var(--glass-strong);border:1px solid var(--glass-border);border-radius:14px;padding:14px;min-width:0}
+.metric .label{font-size:11px;color:var(--sub);margin-bottom:6px}
+.metric .val{font-size:22px;font-weight:700;letter-spacing:-.5px}
+.metric .unit{font-size:12px;color:var(--sub);font-weight:400;margin-left:2px}
+.metric .sub{font-size:11px;color:var(--sub);margin-top:4px}
+.gauge{height:8px;border-radius:4px;background:rgba(128,128,128,.2);overflow:hidden;margin-top:12px}
+.gauge>div{height:100%;border-radius:4px;background:linear-gradient(90deg,var(--green),var(--accent));transition:width .5s}
+
+section{margin-top:18px}
+.sec-title{font-size:13px;font-weight:600;color:var(--sub);margin:0 4px 10px;letter-spacing:.5px}
+.card{padding:16px;margin-bottom:12px}
+
+/* 开关 */
+.toggle-row{display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--glass-border)}
+.toggle-row:last-child{border-bottom:none}
+.toggle-row .info{flex:1;min-width:0}
+.toggle-row .name{font-size:14px;font-weight:500}
+.toggle-row .desc{font-size:12px;color:var(--sub);margin-top:2px}
+.switch{position:relative;width:46px;height:26px;flex-shrink:0;margin-left:12px}
+.switch input{opacity:0;width:0;height:0}
+.slider{position:absolute;cursor:pointer;inset:0;background:rgba(128,128,128,.3);border-radius:26px;transition:.3s}
+.slider:before{content:"";position:absolute;height:20px;width:20px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.3s;box-shadow:0 2px 6px rgba(0,0,0,.25)}
+.switch input:checked+.slider{background:linear-gradient(135deg,var(--accent),var(--accent2))}
+.switch input:checked+.slider:before{transform:translateX(20px)}
+
+/* 滑条 */
+.range-row{padding:12px 0;border-bottom:1px solid var(--glass-border)}
+.range-row:last-child{border-bottom:none}
+.range-row .head{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px}
+.range-row .name{font-size:14px;font-weight:500}
+.range-row .out{font-size:14px;font-weight:700;color:var(--accent)}
+.range-row .desc{font-size:12px;color:var(--sub);margin-top:6px}
+input[type=range]{-webkit-appearance:none;width:100%;height:6px;border-radius:3px;background:rgba(128,128,128,.25);outline:none}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:22px;height:22px;border-radius:50%;
+  background:linear-gradient(135deg,var(--accent),var(--accent2));border:3px solid #fff;cursor:pointer;box-shadow:0 2px 8px rgba(91,140,255,.4)}
+
+/* 按钮 */
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;padding:10px 16px;border-radius:12px;
+  font-size:14px;font-weight:600;border:none;cursor:pointer;transition:.2s}
+.btn:active{transform:scale(.96)}
+.btn-primary{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;width:100%;padding:13px}
+.btn-ghost{background:var(--glass-strong);color:var(--txt);border:1px solid var(--glass-border)}
+.btn-danger{background:rgba(248,113,113,.14);color:var(--red);border:1px solid rgba(248,113,113,.3)}
+.btn-row{display:flex;gap:10px}
+.btn-row .btn{flex:1}
+
+/* 游戏列表 */
+.game-input{display:flex;gap:10px;margin-bottom:12px}
+.game-input input{flex:1;background:var(--glass-strong);border:1px solid var(--glass-border);border-radius:12px;color:var(--txt);
+  padding:10px 12px;font-size:14px;outline:none}
+.game-input input:focus{border-color:var(--accent)}
+.game-item{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;background:var(--glass-strong);
+  border:1px solid var(--glass-border);border-radius:12px;margin-bottom:8px}
+.game-item .pkg{font-size:13px;word-break:break-all}
+.game-item .del{color:var(--red);font-size:12px;cursor:pointer;padding:4px 8px;flex-shrink:0}
+
+/* 日志 */
+.log-box{background:rgba(0,0,0,.25);border:1px solid var(--glass-border);border-radius:12px;padding:12px;font-family:ui-monospace,monospace;
+  font-size:11px;max-height:300px;overflow:auto;white-space:pre-wrap;word-break:break-all;color:var(--sub)}
+[data-theme="light"] .log-box{background:rgba(0,0,0,.05)}
+
+/* 主题选择 */
+.theme-seg{display:flex;gap:8px;margin-bottom:16px}
+.theme-seg .seg{flex:1;text-align:center;padding:10px;border-radius:12px;background:var(--glass-strong);
+  border:1px solid var(--glass-border);cursor:pointer;font-size:13px;color:var(--sub);transition:.2s}
+.theme-seg .seg.active{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;border-color:transparent}
+
+/* 壁纸预览 */
+.wp-preview{width:100%;height:120px;border-radius:14px;border:1px dashed var(--glass-border);
+  display:flex;align-items:center;justify-content:center;color:var(--sub);font-size:12px;
+  background-size:cover;background-position:center;margin-bottom:12px;overflow:hidden}
+
+/* toast */
+#toast{position:fixed;bottom:100px;left:50%;transform:translateX(-50%);background:var(--glass-strong);
+  backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);border:1px solid var(--glass-border);color:var(--txt);
+  padding:10px 18px;border-radius:12px;font-size:13px;z-index:99;opacity:0;transition:.3s;pointer-events:none}
+#toast.show{opacity:1}
+
+/* ============ 独立浮动底栏（酷安风格液态玻璃 + 滑动高亮） ============ */
+nav{
+  position:fixed; left:50%; transform:translateX(-50%); bottom:16px; z-index:30;
+  display:flex; gap:2px; padding:8px;
+  border-radius:24px; max-width:calc(100% - 24px);
+}
+/* 滑动高亮块（平滑跟随，不用过冲曲线，避免掉帧时视觉跳动） */
+nav .tab-highlight{
+  position:absolute; top:8px; bottom:8px; left:8px;
+  border-radius:18px;
+  background:var(--tab-active);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,0.35), 0 2px 10px rgba(0,0,0,0.10);
+  transition:left .25s ease-out, width .25s ease-out;
+  pointer-events:none; z-index:0;
+}
+/* 首次定位期间禁用动画（避免高亮块从错误位置滑过来） */
+nav .no-anim{ transition:none !important; }
+/* 滑动光斑（跟随高亮块） */
+nav .tab-glow{
+  position:absolute; top:0; bottom:0;
+  width:60px; border-radius:18px;
+  background:radial-gradient(ellipse at 50% 20%, rgba(255,255,255,0.30), transparent 70%);
+  transition:left .25s ease-out;
+  pointer-events:none; z-index:0; opacity:.8;
+}
+nav a{flex:1;min-width:52px;text-align:center;padding:8px 6px 7px;color:var(--sub);font-size:10px;
+  text-decoration:none;transition:color .25s, transform .25s;border-radius:18px;position:relative;z-index:1}
+nav a .ico{display:block;font-size:20px;margin-bottom:2px;transition:transform .3s cubic-bezier(.34,1.56,.64,1)}
+nav a.active{color:var(--accent);font-weight:600}
+nav a.active .ico{transform:translateY(-2px) scale(1.08)}
+nav a:active .ico{transform:scale(.85)}
+
+.page{display:none}
+.page.active{display:block}
+</style>
+</head>
+<body>
+
+
+<header class="glass">
+  <div class="brand">
+    <div class="logo">澎</div>
+    <div><h1>澎湃内存管理<small>HyperOS Memory Optimizer</small></h1></div>
+  </div>
+  <div class="badge" id="modeBadge">常态</div>
+</header>
+
+<div class="wrap">
+
+  <!-- 仪表盘页 -->
+  <div class="page active" id="page-dash">
+    <div class="dash glass">
+      <div class="row">
+        <div class="metric"><div class="label">物理内存占用</div><div class="val"><span id="mUsed">--</span><span class="unit">%</span></div><div class="sub" id="mUsedGb"></div></div>
+        <div class="metric"><div class="label">可用内存</div><div class="val"><span id="mAvail">--</span><span class="unit">GB</span></div><div class="sub" id="mAvailPct"></div></div>
+      </div>
+      <div class="gauge"><div id="mGauge" style="width:0%"></div></div>
+      <div class="row">
+        <div class="metric"><div class="label">zram 用量</div><div class="val"><span id="zUsed">--</span><span class="unit">MB</span></div></div>
+        <div class="metric"><div class="label">zram 压缩率</div><div class="val"><span id="zRatio">--</span><span class="unit">%</span></div></div>
+      </div>
+      <div class="row">
+        <div class="metric"><div class="label">内存压力 PSI</div><div class="val"><span id="psi">--</span><span class="unit">%</span></div></div>
+        <div class="metric"><div class="label">守护进程</div><div class="val" style="font-size:16px" id="dState">--</div></div>
+      </div>
+    </div>
+
+    <section>
+      <div class="sec-title">快捷操作</div>
+      <div class="card glass">
+        <div class="btn-row">
+          <button class="btn btn-primary" onclick="act('drop')">清理缓存</button>
+          <button class="btn btn-ghost" onclick="act('apply')">应用配置</button>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <!-- 保活页 -->
+  <div class="page" id="page-keep">
+    <section>
+      <div class="sec-title">主动回收关闭（保活核心）</div>
+      <div class="card glass">
+        <div class="toggle-row"><div class="info"><div class="name">关闭 mimd 内存守护</div><div class="desc">vendor.xiaomi.hardware.mimd2-service 主动回收</div></div>
+          <label class="switch"><input type="checkbox" id="c_mimd" onchange="saveToggle('disable_mimd',this)"><span class="slider"></span></label></div>
+        <div class="toggle-row"><div class="info"><div class="name">关闭 unfairmem 不公平回收</div><div class="desc">persist.sys.miui.unfairMemory.enable</div></div>
+          <label class="switch"><input type="checkbox" id="c_unfair" onchange="saveToggle('disable_unfairmem',this)"><span class="slider"></span></label></div>
+        <div class="toggle-row"><div class="info"><div class="name">关闭 mi_reclaim 内核回收</div><div class="desc">/sys/kernel/mi_reclaim enable 0</div></div>
+          <label class="switch"><input type="checkbox" id="c_mirec" onchange="saveToggle('disable_mi_reclaim',this)"><span class="slider"></span></label></div>
+        <div class="toggle-row"><div class="info"><div class="name">关闭 memory_standard 堆限制</div><div class="desc">persist.sys.memory_standard.enable</div></div>
+          <label class="switch"><input type="checkbox" id="c_memstd" onchange="saveToggle('disable_memory_standard',this)"><span class="slider"></span></label></div>
+      </div>
+    </section>
+
+    <section>
+      <div class="sec-title">后台保活白名单（系统级锁后台，永不被杀）</div>
+      <div class="card glass">
+        <div class="game-input">
+          <input type="text" id="keepPkg" placeholder="输入包名，如 com.tencent.mm">
+          <button class="btn btn-primary" style="width:auto" onclick="addKeep()">添加</button>
+        </div>
+        <div id="keepList"></div>
+        <button class="btn btn-ghost" id="keepToggle" style="width:100%;margin-top:10px;display:none" onclick="toggleKeep()">展开全部</button>
+        <div class="desc" style="padding-top:10px;font-size:12px;color:var(--sub)">
+          白名单内应用走系统「锁定后台」，完全不被杀，但正常参与缓存清理（只清多余内存不杀进程）。默认含微信/QQ/输入法。
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="sec-title">lmkd 阈值（低内存时系统按这三档杀后台）</div>
+      <div class="card glass">
+        <div class="range-row"><div class="head"><span class="name">轻微压力时杀谁</span><span class="out" id="o_low">1001</span></div>
+          <input type="range" id="r_low" min="900" max="1001" step="1" oninput="rangeOut('o_low',this)" onchange="saveRange('lmk_low',this)"><div class="desc">1001 = 不杀任何进程（推荐保持，保活核心）。数字越大越保守</div></div>
+        <div class="range-row"><div class="head"><span class="name">中等压力时杀谁</span><span class="out" id="o_medium">950</span></div>
+          <input type="range" id="r_medium" min="900" max="1001" step="1" oninput="rangeOut('o_medium',this)" onchange="saveRange('lmk_medium',this)"><div class="desc">内存开始紧张时，只杀「后台编号 ≥ 此值」的进程。900~950 = 只杀纯缓存页面</div></div>
+        <div class="range-row"><div class="head"><span class="name">严重压力时杀谁</span><span class="out" id="o_critical">900</span></div>
+          <input type="range" id="r_critical" min="800" max="1000" step="1" oninput="rangeOut('o_critical',this)" onchange="saveRange('lmk_critical',this)"><div class="desc">内存快满时的最后防线。900 = 只杀纯缓存进程，正在前台的和常驻后台不受影响</div></div>
+        <div class="desc" style="padding:10px 4px 0;color:var(--amber)">⚠ 三档顺序必须是：轻微 ≥ 中等 ≥ 严重（例如 1001 / 950 / 900）。数值越靠右（越大）越不杀</div>
+      </div>
+    </section>
+  </div>
+
+  <!-- 内存页 -->
+  <div class="page" id="page-mem">
+    <section>
+      <div class="sec-title">内存水位控制</div>
+      <div class="card glass">
+        <div class="range-row"><div class="head"><span class="name">目标占用水位</span><span class="out" id="o_target">80</span></div>
+          <input type="range" id="r_target" min="60" max="95" step="1" oninput="rangeOut('o_target',this)" onchange="saveRange('watermark_target',this)"><div class="desc">内存用到这个 % 时自动清一次缓存，让占用稳定在这个水平附近</div></div>
+        <div class="range-row"><div class="head"><span class="name">迟滞（防抖动）</span><span class="out" id="o_hyst">5</span></div>
+          <input type="range" id="r_hyst" min="1" max="15" step="1" oninput="rangeOut('o_hyst',this)" onchange="saveRange('watermark_hysteresis',this)"><div class="desc">清完后要降到「水位 − 此值」以下才停止清理，避免反复清理浪费电</div></div>
+        <div class="toggle-row"><div class="info"><div class="name">强力清理</div><div class="desc">开 = 连内核缓存对象一起清（更彻底但略卡顿），关 = 只清文件缓存（温和）</div></div>
+          <label class="switch"><input type="checkbox" id="c_droplevel" onchange="saveToggleLevel(this)"><span class="slider"></span></label></div>
+      </div>
+    </section>
+
+    <section>
+      <div class="sec-title">zram 管理</div>
+      <div class="card glass">
+        <div class="toggle-row"><div class="info"><div class="name">接管 zram/swappiness</div><div class="desc">默认关闭，交给 scene_swap_controller</div></div>
+          <label class="switch"><input type="checkbox" id="c_zram" onchange="saveToggle('zram_takeover',this)"><span class="slider"></span></label></div>
+        <div class="range-row"><div class="head"><span class="name">换页积极性 (swappiness)</span><span class="out" id="o_sw">80</span></div>
+          <input type="range" id="r_sw" min="0" max="200" step="5" oninput="rangeOut('o_sw',this)" onchange="saveRange('swappiness',this)"><div class="desc">多大程度把不常用的内存压进 zram。0=不压（最占内存），80~100=推荐，再高会费 CPU</div></div>
+      </div>
+    </section>
+  </div>
+
+  <!-- 游戏页 -->
+  <div class="page" id="page-game">
+    <section>
+      <div class="sec-title">游戏模式</div>
+      <div class="card glass">
+        <div class="toggle-row"><div class="info"><div class="name">启用游戏模式</div><div class="desc">检测到白名单游戏启动时，自动腾出内存</div></div>
+          <label class="switch"><input type="checkbox" id="c_gamemode" onchange="saveToggle('game_mode',this)"><span class="slider"></span></label></div>
+        <div class="toggle-row"><div class="info"><div class="name">清理无关后台</div><div class="desc">游戏启动时，把不在白名单里的纯缓存后台进程交给系统回收（不是强杀）</div></div>
+          <label class="switch"><input type="checkbox" id="c_kill" onchange="saveToggle('game_kill_cached',this)"><span class="slider"></span></label></div>
+        <div class="toggle-row"><div class="info"><div class="name">游戏时清缓存</div><div class="desc">游戏启动瞬间清一次文件缓存，给游戏腾更多空闲内存</div></div>
+          <label class="switch"><input type="checkbox" id="c_dropgame" onchange="saveToggle('game_drop_caches',this)"><span class="slider"></span></label></div>
+      </div>
+    </section>
+
+    <section>
+      <div class="sec-title">游戏白名单</div>
+      <div class="card glass">
+        <div class="game-input">
+          <input type="text" id="gamePkg" placeholder="输入包名，如 com.tencent.tmgp.sgame">
+          <button class="btn btn-primary" style="width:auto" onclick="addGame()">添加</button>
+        </div>
+        <div id="gameList"></div>
+        <button class="btn btn-ghost" id="gameToggle" style="width:100%;margin-top:10px;display:none" onclick="toggleGames()">展开全部</button>
+      </div>
+    </section>
+  </div>
+
+  <!-- 日志页 -->
+  <div class="page" id="page-log">
+    <section>
+      <div class="sec-title">运行日志</div>
+      <div class="card glass">
+        <div class="btn-row" style="margin-bottom:12px">
+          <button class="btn btn-ghost" onclick="loadLog()">刷新</button>
+          <button class="btn btn-danger" onclick="act('log_clear')">清空</button>
+        </div>
+        <div class="log-box" id="logBox">加载中…</div>
+      </div>
+    </section>
+  </div>
+
+  <!-- 外观页 -->
+  <div class="page" id="page-ui">
+    <section>
+      <div class="sec-title">主题模式</div>
+      <div class="card glass">
+        <div class="theme-seg" id="themeSeg">
+          <div class="seg" data-theme="system" onclick="setTheme('system')">跟随系统</div>
+          <div class="seg" data-theme="light" onclick="setTheme('light')">浅色</div>
+          <div class="seg" data-theme="dark" onclick="setTheme('dark')">深色</div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="sec-title">壁纸</div>
+      <div class="card glass">
+        <div class="wp-preview" id="wpPreview">暂无壁纸</div>
+        <div class="btn-row">
+          <button class="btn btn-primary" onclick="document.getElementById('wpFile').click()">选择图片</button>
+          <button class="btn btn-danger" onclick="clearWallpaper()">清除壁纸</button>
+        </div>
+        <input type="file" id="wpFile" accept="image/*" style="display:none" onchange="setWallpaper(this.files[0])">
+      </div>
+    </section>
+
+    <section>
+      <div class="sec-title">液态玻璃</div>
+      <div class="card glass">
+        <div class="range-row"><div class="head"><span class="name">模糊度</span><span class="out" id="o_blur">12</span></div>
+          <input type="range" id="r_blur" min="0" max="40" step="1" oninput="rangeOut('o_blur',this)" onchange="setBlur(this.value)"><div class="desc">玻璃背景模糊程度，0=不模糊</div></div>
+        <div class="range-row"><div class="head"><span class="name">透明度</span><span class="out" id="o_opacity">100</span></div>
+          <input type="range" id="r_opacity" min="0" max="100" step="1" oninput="rangeOut('o_opacity',this)" onchange="setOpacity(this.value)"><div class="desc">玻璃背景透明度，0=完全透明</div></div>
+      </div>
+    </section>
+  </div>
+
+</div>
+
+<nav class="glass">
+  <a href="#dash" class="active" data-page="page-dash"><span class="ico">📊</span>仪表盘</a>
+  <a href="#keep" data-page="page-keep"><span class="ico">🛡️</span>保活</a>
+  <a href="#mem" data-page="page-mem"><span class="ico">💾</span>内存</a>
+  <a href="#game" data-page="page-game"><span class="ico">🎮</span>游戏</a>
+  <a href="#log" data-page="page-log"><span class="ico">📜</span>日志</a>
+  <a href="#ui" data-page="page-ui"><span class="ico">🎨</span>外观</a>
+</nav>
+
+<div id="toast"></div>
+
+<script>
+// ============ 主题管理 ============
+function getTheme(){ return localStorage.getItem('hkom_theme') || 'system'; }
+function applyTheme(){
+  let t = getTheme();
+  let resolved = t;
+  if(t === 'system'){
+    resolved = (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) ? 'light' : 'dark';
+  }
+  document.documentElement.setAttribute('data-theme', resolved);
+  // 更新分段选择器高亮
+  document.querySelectorAll('#themeSeg .seg').forEach(s=>{
+    s.classList.toggle('active', s.dataset.theme === t);
+  });
+  // 主题切换后重算玻璃透明度（内联变量依赖当前主题）
+  applyGlass();
+}
+function setTheme(t){
+  localStorage.setItem('hkom_theme', t);
+  applyTheme();
+  toast('主题：' + (t==='system'?'跟随系统':t==='light'?'浅色':'深色'));
+}
+
+// ============ 壁纸管理 ============
+function applyWallpaper(){
+  const wp = localStorage.getItem('hkom_wallpaper');
+  if(wp){
+    document.body.style.setProperty('--wallpaper', `url(${wp})`);
+    document.getElementById('wpPreview').style.backgroundImage = `url(${wp})`;
+    document.getElementById('wpPreview').textContent = '';
+  } else {
+    document.body.style.removeProperty('--wallpaper');
+    document.getElementById('wpPreview').style.backgroundImage = 'none';
+    document.getElementById('wpPreview').textContent = '暂无壁纸';
+  }
+}
+function setWallpaper(file){
+  if(!file) return;
+  const reader = new FileReader();
+  reader.onload = function(e){
+    const img = new Image();
+    img.onload = function(){
+      // 压缩到最大 1280px，控制 localStorage 体积
+      const canvas = document.createElement('canvas');
+      let w = img.width, h = img.height;
+      const max = 1280;
+      if(w > max){ h = Math.round(h * max / w); w = max; }
+      canvas.width = w; canvas.height = h;
+      canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+      let data;
+      try{
+        data = canvas.toDataURL('image/jpeg', 0.82);
+      }catch(err){
+        data = e.target.result;
+      }
+      try{
+        localStorage.setItem('hkom_wallpaper', data);
+        applyWallpaper();
+        toast('壁纸已设置');
+      }catch(err){
+        toast('图片过大，请换小图');
+      }
+    };
+    img.src = e.target.result;
+  };
+  reader.readAsDataURL(file);
+}
+function clearWallpaper(){
+  localStorage.removeItem('hkom_wallpaper');
+  applyWallpaper();
+  toast('壁纸已清除');
+}
+
+// ============ 液态玻璃调节 ============
+function getBlur(){ return localStorage.getItem('hkom_blur') || '12'; }
+function getOpacity(){
+  const v = localStorage.getItem('hkom_opacity');
+  // 注意：不能写 parseInt(v) || 100 —— 0 是假值会把 0% 弹回 100%
+  return v === null || v === undefined ? '100' : v;
+}
+function applyGlass(){
+  const blur = getBlur();
+  const op = parseInt(getOpacity(), 10);
+  if(isNaN(op)) { op = 100; }
+  // 透明度 = op% 作用于玻璃背景的 alpha，直接改 --glass 相关变量
+  const a1 = (0.03 * op / 100).toFixed(3);   // 深色 glass 基础 alpha 0.06
+  const a2 = (0.05 * op / 100).toFixed(3);   // 深色 glass-strong 基础 alpha 0.10
+  const l1 = (0.10 * op / 100).toFixed(3);   // 浅色 glass 基础 alpha 0.55
+  const l2 = (0.16 * op / 100).toFixed(3);   // 浅色 glass-strong 基础 alpha 0.72
+  document.documentElement.style.setProperty('--glass-blur', blur + 'px');
+  document.documentElement.style.setProperty('--glass-opacity', (op/100));
+  // 透明度滑条归零时，边框与白色高光也一并消失（否则拖到 0% 卡片轮廓还在）
+  document.documentElement.style.setProperty('--glass-border', 'rgba(255,255,255,' + (0.14*op/100).toFixed(3) + ')');
+  document.documentElement.style.setProperty('--glass-highlight', 'rgba(255,255,255,' + (0.10*op/100).toFixed(3) + ')');
+  // 深色
+  document.documentElement.style.setProperty('--glass', `rgba(255,255,255,${a1})`);
+  document.documentElement.style.setProperty('--glass-strong', `rgba(255,255,255,${a2})`);
+  // 通过 CSS 变量级联覆盖浅色（用 [data-theme=light] 优先级问题，这里直接再设一层内联变量）
+  // 注意：内联变量会覆盖主题定义，需要按当前主题分别设置
+  const theme = document.documentElement.getAttribute('data-theme');
+  if(theme === 'light'){
+    document.documentElement.style.setProperty('--glass', `rgba(255,255,255,${l1})`);
+    document.documentElement.style.setProperty('--glass-strong', `rgba(255,255,255,${l2})`);
+  }
+  document.getElementById('r_blur').value = blur;
+  document.getElementById('o_blur').textContent = blur;
+  document.getElementById('r_opacity').value = op;
+  document.getElementById('o_opacity').textContent = op;
+}
+function setBlur(v){
+  localStorage.setItem('hkom_blur', v);
+  applyGlass();
+  toast('模糊度 ' + v + 'px');
+}
+function setOpacity(v){
+  localStorage.setItem('hkom_opacity', v);
+  applyGlass();
+  toast('透明度 ' + v + '%');
+}
+
+// ============ 桥接层：KernelSU exec ============
+let callbackCounter = 0;
+function execKsu(command, options = {}) {
+  return new Promise((resolve) => {
+    if (typeof window.ksu === 'undefined' || !window.ksu.exec) {
+      resolve({ errno: 1, stdout: "", stderr: "ksu not available" });
+      return;
+    }
+    const cbName = `cb_${Date.now()}_${callbackCounter++}`;
+    window[cbName] = (errno, stdout, stderr) => {
+      resolve({ errno, stdout: stdout || "", stderr: stderr || "" });
+      delete window[cbName];
+    };
+    try {
+      ksu.exec(command, JSON.stringify(options), cbName);
+    } catch (e) {
+      delete window[cbName];
+      resolve({ errno: 1, stdout: "", stderr: String(e) });
+    }
+  });
+}
+function hasKsu(){ return typeof window.ksu !== 'undefined' && window.ksu.exec; }
+const ACT = '/data/adb/modules/hyperos_keepalive_opt/action.sh';
+async function execRet(cmd){
+  if(!hasKsu()) return '';
+  const r = await execKsu('sh ' + ACT + ' ' + cmd);
+  return r.stdout.trim();
+}
+
+// ============ toast ============
+let toastTimer;
+function toast(msg){
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(()=>t.classList.remove('show'), 2000);
+}
+
+// ============ 动作执行 ============
+async function act(cmd){
+  if(!hasKsu()){ toast('请在 KernelSU 管理器 WebUI 中打开'); return; }
+  await execRet(cmd);
+  toast('已执行: ' + cmd);
+  if(cmd === 'log_clear'){ await loadLog(); }
+  await refreshDash();
+}
+
+// ============ 底栏液态滑动高亮 ============
+let tabHlCtx = null; // {nav, hl, glow, moveHl}
+function initTabHighlight(){
+  const nav = document.querySelector('nav');
+  if(!nav) return;
+  // 注入高亮块和光斑（仅一次）
+  if(tabHlCtx && tabHlCtx.nav === nav) return;
+  const hl = document.createElement('div');
+  hl.className = 'tab-highlight';
+  const glow = document.createElement('div');
+  glow.className = 'tab-glow';
+  nav.appendChild(hl);
+  nav.appendChild(glow);
+
+  // 用布局坐标（offsetLeft/offsetWidth），不受视口滚动、字体加载时序影响，
+  // 彻底解决「getBoundingClientRect 在字体加载前测量 → 字体加载后宽度变化 → 跳动」的问题。
+  function moveHl(target){
+    if(!target) return;
+    // target.offsetLeft 相对 nav 的 padding edge；hl/glow 绝对定位基准也是 nav padding edge，坐标系一致
+    hl.style.width = target.offsetWidth + 'px';
+    hl.style.left = target.offsetLeft + 'px';
+    glow.style.width = (target.offsetWidth + 16) + 'px';
+    glow.style.left = (target.offsetLeft - 8) + 'px';
+  }
+  tabHlCtx = { nav, hl, glow, moveHl };
+
+  const reposition = ()=>moveHl(nav.querySelector('a.active'));
+  // 点击时平滑滑动
+  nav.querySelectorAll('a').forEach(a=>{
+    a.addEventListener('click', ()=>moveHl(a));
+  });
+  // 横竖屏/字号变化时重定位
+  window.addEventListener('resize', reposition);
+  // 首次定位：禁用动画直接就位（防止高亮块从错误位置滑过来），布局稳定后再开动画
+  hl.classList.add('no-anim');
+  glow.classList.add('no-anim');
+  reposition();
+  const enableAnim = ()=>{
+    hl.classList.remove('no-anim');
+    glow.classList.remove('no-anim');
+    // 布局稳定后（字体加载完）再校准一次位置
+    reposition();
+  };
+  if(document.fonts && document.fonts.ready){
+    document.fonts.ready.then(()=>requestAnimationFrame(enableAnim));
+  } else {
+    window.addEventListener('load', ()=>requestAnimationFrame(enableAnim));
+  }
+}
+
+// ============ 导航 ============
+document.querySelectorAll('nav a').forEach(a=>{
+  a.addEventListener('click',e=>{
+    e.preventDefault();
+    document.querySelectorAll('nav a').forEach(x=>x.classList.remove('active'));
+    document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
+    a.classList.add('active');
+    document.getElementById(a.dataset.page).classList.add('active');
+    if(a.dataset.page==='page-dash') refreshDash();
+    if(a.dataset.page==='page-log') loadLog();
+  });
+});
+
+// ============ 配置读取 ============
+async function loadConf(){
+  if(!hasKsu()) return;
+  const kv = await execRet('list_conf');
+  let map = {};
+  kv.split('\n').forEach(l=>{ let i=l.indexOf('='); if(i>0) map[l.slice(0,i)] = l.slice(i+1); });
+  setChk('c_mimd', map.disable_mimd);
+  setChk('c_unfair', map.disable_unfairmem);
+  setChk('c_mirec', map.disable_mi_reclaim);
+  setChk('c_memstd', map.disable_memory_standard);
+  setChk('c_gamemode', map.game_mode);
+  setChk('c_kill', map.game_kill_cached);
+  setChk('c_dropgame', map.game_drop_caches);
+  setChk('c_zram', map.zram_takeover);
+  setChk('c_droplevel', map.drop_level==='3');
+  setRange('r_critical', map.lmk_critical, 'o_critical');
+  setRange('r_medium', map.lmk_medium, 'o_medium');
+  setRange('r_low', map.lmk_low, 'o_low');
+  setRange('r_target', map.watermark_target, 'o_target');
+  setRange('r_hyst', map.watermark_hysteresis, 'o_hyst');
+  setRange('r_sw', map.swappiness, 'o_sw');
+}
+function setChk(id, v){ document.getElementById(id).checked = (v==='1'); }
+function setRange(id, v, outId){
+  document.getElementById(id).value = v;
+  document.getElementById(outId).textContent = v;
+}
+
+// ============ 保存 ============
+async function saveToggle(key, el){
+  if(!hasKsu()){ toast('请在 KernelSU WebUI 中打开'); return; }
+  await execRet('set ' + key + ' ' + (el.checked?1:0));
+  toast(key + ' = ' + (el.checked?1:0));
+  await execRet('apply');
+}
+async function saveToggleLevel(el){
+  if(!hasKsu()){ toast('请在 KernelSU WebUI 中打开'); return; }
+  const v = el.checked ? 3 : 1;
+  await execRet('set drop_level ' + v);
+  toast('drop_level = ' + v);
+}
+async function saveRange(key, el){
+  if(!hasKsu()) return;
+  await execRet('set ' + key + ' ' + el.value);
+  await execRet('apply');
+}
+function rangeOut(outId, el){ document.getElementById(outId).textContent = el.value; }
+
+// ============ 游戏白名单 ============
+let allGamePkgs = [];      // 完整包名数组
+let gameExpanded = false;  // 是否已展开
+const GAME_COLLAPSE_N = 3; // 收起时显示前 N 个
+function renderGames(){
+  const box = document.getElementById('gameList');
+  const toggle = document.getElementById('gameToggle');
+  if(allGamePkgs.length === 0){
+    box.innerHTML = '<div style="color:var(--sub);font-size:12px">暂无白名单</div>';
+    toggle.style.display = 'none';
+    return;
+  }
+  const shown = gameExpanded ? allGamePkgs : allGamePkgs.slice(0, GAME_COLLAPSE_N);
+  box.innerHTML = shown.map(p=>{
+    return '<div class="game-item"><span class="pkg">'+p+'</span><span class="del" onclick="delGame(\''+p+'\')">删除</span></div>';
+  }).join('');
+  // 超过折叠数才显示展开按钮
+  if(allGamePkgs.length > GAME_COLLAPSE_N){
+    toggle.style.display = 'block';
+    toggle.textContent = gameExpanded ? ('收起（共 '+allGamePkgs.length+' 个）') : ('展开全部（共 '+allGamePkgs.length+' 个）');
+  } else {
+    toggle.style.display = 'none';
+  }
+}
+function toggleGames(){
+  gameExpanded = !gameExpanded;
+  renderGames();
+}
+async function loadGames(){
+  if(!hasKsu()){ document.getElementById('gameList').innerHTML='<div style="color:var(--sub);font-size:12px">请在 KernelSU WebUI 中打开</div>'; return; }
+  const list = await execRet('game_list');
+  if(!list){ allGamePkgs = []; renderGames(); return; }
+  allGamePkgs = list.split('\n').filter(x=>x.trim()&&!x.startsWith('#')).map(x=>x.trim());
+  gameExpanded = false; // 每次重新加载默认收起
+  renderGames();
+}
+async function addGame(){
+  const p = document.getElementById('gamePkg').value.trim();
+  if(!p){ toast('请输入包名'); return; }
+  if(!hasKsu()){ toast('请在 KernelSU WebUI 中打开'); return; }
+  await execRet('game_add ' + p);
+  document.getElementById('gamePkg').value = '';
+  await loadGames(); toast('已添加 '+p);
+}
+async function delGame(p){
+  if(!hasKsu()) return;
+  await execRet('game_del ' + p);
+  await loadGames(); toast('已删除 '+p);
+}
+
+// ============ 后台保活白名单 ============
+let allKeepPkgs = [];
+let keepExpanded = false;
+const KEEP_COLLAPSE_N = 3;
+function renderKeep(){
+  const box = document.getElementById('keepList');
+  const toggle = document.getElementById('keepToggle');
+  if(allKeepPkgs.length === 0){
+    box.innerHTML = '<div style="color:var(--sub);font-size:12px">暂无保活白名单</div>';
+    toggle.style.display = 'none';
+    return;
+  }
+  const shown = keepExpanded ? allKeepPkgs : allKeepPkgs.slice(0, KEEP_COLLAPSE_N);
+  box.innerHTML = shown.map(p=>{
+    return '<div class="game-item"><span class="pkg">'+p+'</span><span class="del" onclick="delKeep(\''+p+'\')">删除</span></div>';
+  }).join('');
+  if(allKeepPkgs.length > KEEP_COLLAPSE_N){
+    toggle.style.display = 'block';
+    toggle.textContent = keepExpanded ? ('收起（共 '+allKeepPkgs.length+' 个）') : ('展开全部（共 '+allKeepPkgs.length+' 个）');
+  } else {
+    toggle.style.display = 'none';
+  }
+}
+function toggleKeep(){ keepExpanded = !keepExpanded; renderKeep(); }
+async function loadKeep(){
+  if(!hasKsu()){ document.getElementById('keepList').innerHTML='<div style="color:var(--sub);font-size:12px">请在 KernelSU WebUI 中打开</div>'; return; }
+  const list = await execRet('keep_list');
+  if(!list){ allKeepPkgs = []; renderKeep(); return; }
+  allKeepPkgs = list.split('\n').filter(x=>x.trim()&&!x.startsWith('#')).map(x=>x.trim());
+  keepExpanded = false;
+  renderKeep();
+}
+async function addKeep(){
+  const p = document.getElementById('keepPkg').value.trim();
+  if(!p){ toast('请输入包名'); return; }
+  if(!hasKsu()){ toast('请在 KernelSU WebUI 中打开'); return; }
+  await execRet('keep_add ' + p);
+  document.getElementById('keepPkg').value = '';
+  await loadKeep(); toast('已添加保活 '+p);
+}
+async function delKeep(p){
+  if(!hasKsu()) return;
+  await execRet('keep_del ' + p);
+  await loadKeep(); toast('已移除保活 '+p);
+}
+
+// ============ 仪表盘刷新 ============
+async function refreshDash(){
+  if(!hasKsu()){ toast('请在 KernelSU WebUI 中打开'); return; }
+  const s = await execRet('snapshot');
+  let map = {};
+  s.split('\n').forEach(l=>{ let i=l.indexOf('='); if(i>0) map[l.slice(0,i)] = l.slice(i+1); });
+  document.getElementById('mUsed').textContent = map.used_pct || '--';
+  document.getElementById('mAvail').textContent = (map.avail/1048576).toFixed(1) || '--';
+  document.getElementById('mAvailPct').textContent = '可用 ' + (map.avail_pct||'--') + '%';
+  document.getElementById('mUsedGb').textContent = '总 ' + (map.total/1048576).toFixed(1) + 'GB · 已用 ' + ((map.total-map.avail)/1048576).toFixed(1) + 'GB';
+  document.getElementById('mGauge').style.width = (map.used_pct||0) + '%';
+  document.getElementById('zUsed').textContent = map.zram_used_mb || '--';
+  document.getElementById('zRatio').textContent = map.zram_ratio || '--';
+  document.getElementById('psi').textContent = map.psi300 || '--';
+  document.getElementById('dState').textContent = map.mimd || '--';
+  const st = await execRet('status');
+  let sm = {};
+  st.split('\n').forEach(l=>{ let i=l.indexOf('='); if(i>0) sm[l.slice(0,i)] = l.slice(i+1); });
+  const badge = document.getElementById('modeBadge');
+  if(sm.mode==='game'){ badge.textContent='游戏模式'; badge.className='badge game'; }
+  else { badge.textContent='常态'; badge.className='badge'; }
+}
+
+// ============ 日志 ============
+async function loadLog(){
+  if(!hasKsu()){ document.getElementById('logBox').textContent='请在 KernelSU WebUI 中打开'; return; }
+  const log = await execRet('log_tail 200');
+  document.getElementById('logBox').textContent = (log||'暂无日志');
+}
+
+// ============ 初始加载 ============
+initTabHighlight();
+applyTheme();
+applyWallpaper();
+applyGlass();
+// 跟随系统时监听系统主题变化
+if(window.matchMedia){
+  window.matchMedia('(prefers-color-scheme: light)').addEventListener('change', ()=>{
+    if(getTheme() === 'system') applyTheme();
+  });
+}
+loadConf();
+loadGames();
+loadKeep();
+refreshDash();
+</script>
+</body>
+</html>

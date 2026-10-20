@@ -1,0 +1,160 @@
+#!/system/bin/sh
+# ============================================================
+# 澎湃内存管理优化 - daemon.sh（主循环）
+# 职责：惰性轮询（常态10s/游戏3s），水位判定+清缓存+游戏腾内存+兜底关回收
+# 纪律：pidof 精确检测不扫 /proc；单次 awk 全解析；自身开销近零
+# ============================================================
+MODDIR=${0%/*}
+source "$MODDIR/lib.sh"
+
+# 单实例保护（service.sh 已 lock，这里再兜底一次）
+if ! lock_instance "$DAEMON_PID"; then
+  exit 0
+fi
+
+log INF "守护进程启动 pid=$$"
+set_status daemon "running"
+
+# 内部状态
+prev_drop=0          # 上一次是否因水位清过缓存（迟滞用）
+  game_active=0        # 当前游戏态
+  prev_game=0          # 上一轮游戏态（用于检测游戏进入/退出沿）
+  reclaim_guard=0      # 主动回收兜底计数器（每 N 轮执行一次，降开销）
+  beat=0               # 心跳计数器
+
+# 检查游戏进程是否存活（白名单内任一主包 pidof 命中）
+check_game_alive() {
+  local line
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -z "$line" ] && continue
+    if [ -n "$(pidof "$line" 2>/dev/null)" ]; then
+      return 0
+    fi
+  done < "$GAMES"
+  return 1
+}
+
+# 清理无关缓存进程（游戏模式：只杀 CACHED adj 的非白名单进程）
+# 用 am kill 优雅回收，避免 kill -9 粗暴中断
+kill_unrelated_cached() {
+  local pkg uid killed=0
+  for pid in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
+    adj=$(cat /proc/$pid/oom_score_adj 2>/dev/null)
+    [ -z "$adj" ] && continue
+    [ "$adj" -lt 900 ] 2>/dev/null && continue
+    pkg=$(cat /proc/$pid/cmdline 2>/dev/null | tr '\0' ' ' | cut -d' ' -f1)
+    [ -z "$pkg" ] && continue
+    # 跳过白名单游戏
+    if grep -qx "$pkg" "$GAMES" 2>/dev/null; then
+      continue
+    fi
+    # 跳过后台保活白名单（M10：永不清理的锁后台应用）
+    if grep -qx "$pkg" "$KEEP_CONF" 2>/dev/null; then
+      continue
+    fi
+    # 跳过系统关键进程（uid<10000 的 system app 不杀）
+    uid=$(cat /proc/$pid/status 2>/dev/null | grep '^Uid:' | awk '{print $2}')
+    [ -n "$uid" ] && [ "$uid" -lt 10000 ] 2>/dev/null && continue
+    # 用 am kill 优雅回收（走 AMS 正常清理流程）
+    am kill "$pkg" >/dev/null 2>&1
+    killed=$((killed+1))
+  done
+  [ "$killed" -gt 0 ] && log GAME "已回收 $killed 个缓存后台进程"
+}
+
+# 主循环
+while :; do
+  # ---- 游戏态判定（结合事件状态 + 进程存活）----
+  event_game=$(grep '^game=' "$STATUS" 2>/dev/null | cut -d'=' -f2)
+  if [ "$event_game" = "1" ]; then
+    # 事件说在游戏，复核进程是否还活着
+    if check_game_alive; then
+      game_active=1
+    else
+      game_active=0
+      set_status game "0"
+      set_status game_pkg ""
+    fi
+  else
+    # 事件没触发，直接以进程存活为准
+    if check_game_alive; then
+      game_active=1
+    else
+      game_active=0
+    fi
+  fi
+
+  if [ "$game_active" = "1" ]; then
+    set_status mode "game"
+    # 游戏开始时执行一次腾内存
+    if [ "$prev_game" != "1" ]; then
+      log GAME "游戏模式开始"
+      if [ "$(get_conf game_kill_cached)" = "1" ]; then
+        kill_unrelated_cached
+      fi
+      if [ "$(get_conf game_drop_caches)" = "1" ]; then
+        drop_cache 3
+        log MEM "游戏模式清理缓存 drop_caches=3"
+      fi
+    fi
+    prev_game=1
+  else
+    set_status mode "normal"
+    if [ "$prev_game" = "1" ]; then
+      log GAME "游戏模式结束"
+    fi
+    prev_game=0
+  fi
+
+  # ---- 水位判定（M3，常态与游戏态都执行，但游戏态不因水位清缓存避免争抢）----
+  mem_snapshot
+  target=$(get_conf watermark_target)
+  hyst=$(get_conf watermark_hysteresis)
+  stop_at=$(( target - hyst ))
+
+  if [ "$game_active" != "1" ]; then
+    # 常态：占用 > target 且上次未在迟滞区内，则清缓存
+    if [ "$MEM_USED_PCT" -ge "$target" ] && [ "$prev_drop" = "0" ]; then
+      lvl=$(get_conf drop_level)
+      drop_cache "$lvl"
+      log MEM "内存占用 ${MEM_USED_PCT}% 达到水位 ${target}%，已清理缓存 (级别=$lvl)"
+      prev_drop=1
+    elif [ "$MEM_USED_PCT" -le "$stop_at" ]; then
+      # 降到 stop_at 以下，退出迟滞区
+      prev_drop=0
+    fi
+  fi
+
+  # ---- 兜底：每 N 轮检查主动回收是否被重新拉起（M1 兜底，降低开销）----
+  reclaim_guard=$(( reclaim_guard + 1 ))
+  if [ "$reclaim_guard" -ge 5 ]; then
+    reclaim_guard=0
+    apply_reclaim_off
+  fi
+
+  # ---- 心跳日志（每 30 轮一条，常态约 5 分钟/游戏态约 90 秒，证明 daemon 存活且在工作）----
+  beat=$(( beat + 1 ))
+  if [ $(( beat % 30 )) -eq 0 ]; then
+    log INF "心跳 内存${MEM_USED_PCT}% 可用${MEM_AVAIL_PCT}% zram$(zram_used_mb)MB 压缩率$(zram_ratio)% PSI$(psi_avg300)% 模式=${game_active}游戏"
+  fi
+
+  # ---- 写实时状态（供 WebUI 读取）----
+  set_status used_pct "$MEM_USED_PCT"
+  set_status avail_pct "$MEM_AVAIL_PCT"
+  set_status zram_mb "$(zram_used_mb)"
+  set_status zram_ratio "$(zram_ratio)"
+  set_status psi300 "$(psi_avg300)"
+  set_status updated_at "$(date '+%F %T')"
+
+  # ---- 惰性轮询间隔 ----
+  if [ "$game_active" = "1" ]; then
+    sleep "$(get_conf poll_game)"
+  else
+    sleep "$(get_conf poll_normal)"
+  fi
+done
+
+# 不应到达这里
+unlock_instance "$DAEMON_PID"
+log WRN "守护进程退出"
+exit 0

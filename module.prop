@@ -1,0 +1,6 @@
+id=hyperos_keepalive_opt
+name=澎湃内存管理优化
+version=2.0.0
+versionCode=200
+author=雨色
+description=HyperOS3内存管理优化：关闭主动回收保后台、lmkd保守化、内存水位控制、游戏模式自动腾内存、WebUI图形配置。不碰CPU调度，daemon事件驱动+惰性轮询近零开销。
