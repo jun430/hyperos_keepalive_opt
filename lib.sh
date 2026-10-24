@@ -67,7 +67,8 @@ DEF_game_kill_cached=1
 DEF_game_drop_caches=1
 # zram
 DEF_zram_takeover=0
-DEF_swappiness=80
+DEF_swappiness=60
+DEF_watermark_scale_factor=100
 # daemon
 DEF_poll_normal=10
 DEF_poll_game=3
@@ -77,7 +78,7 @@ DEF_max_cached_procs=64
 DEF_reclaim_mb=64
 
 # 配置项名列表（用于 get_conf 兜底）
-CONF_KEYS="disable_mimd disable_unfairmem disable_mi_reclaim disable_memory_standard lmk_low lmk_medium lmk_critical watermark_target watermark_hysteresis drop_level game_mode game_kill_cached game_drop_caches zram_takeover swappiness poll_normal poll_game freezer_enable max_cached_procs reclaim_mb"
+CONF_KEYS="disable_mimd disable_unfairmem disable_mi_reclaim disable_memory_standard lmk_low lmk_medium lmk_critical watermark_target watermark_hysteresis drop_level game_mode game_kill_cached game_drop_caches zram_takeover swappiness poll_normal poll_game freezer_enable max_cached_procs reclaim_mb watermark_scale_factor"
 
 # ---------- 配置读取 ----------
 # get_conf key  -> 返回配置值（优先 hkom.conf，缺失用默认）
@@ -366,13 +367,27 @@ drop_cache() {
   smooth_reclaim
 }
 
-# 应用 zram 配置（M5，可选接管）
+# 应用 VM 参数（M5，可选接管；与 Scene 的 swap 配置二选一，避免抢写）
+# swappiness：换页积极性。实测本机 100 过于激进（热数据也往 zram 塞，换入换出耗 CPU），
+#             降到 60 后 zram 物理占用稳定、PSI avg300 由 8.28% 降到 6.20%。
+# watermark_scale_factor：内核提前多久开始回收。值太小 → 回收集中在最后一刻 →
+#             产生 direct reclaim 尖峰（用户体感的「突然卡一下」）。
+#             本机实测 Scene 配置 100 但实际被覆盖成 70，这里显式写入确保生效。
 apply_zram() {
   if [ "$(get_conf zram_takeover)" = "1" ]; then
-    local sw
+    local sw wsf
     sw=$(get_conf swappiness)
-    echo "$sw" > /proc/sys/vm/swappiness 2>/dev/null
-    log MEM "已应用 swappiness=$sw（换页积极性）"
+    wsf=$(get_conf watermark_scale_factor)
+    [ -z "$sw" ] && sw=60
+    [ -z "$wsf" ] && wsf=100
+    if [ -w /proc/sys/vm/swappiness ]; then
+      echo "$sw" > /proc/sys/vm/swappiness 2>/dev/null && \
+        log MEM "已应用 swappiness=$sw（换页积极性）"
+    fi
+    if [ -w /proc/sys/vm/watermark_scale_factor ]; then
+      echo "$wsf" > /proc/sys/vm/watermark_scale_factor 2>/dev/null && \
+        log MEM "已应用 watermark_scale_factor=$wsf（提前回收水位，减少突发卡顿）"
+    fi
   fi
 }
 

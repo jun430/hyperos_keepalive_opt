@@ -22,15 +22,25 @@ prev_drop=0          # 上一次是否因水位清过缓存（迟滞用）
   reclaim_guard=0      # 主动回收兜底计数器（每 N 轮执行一次，降开销）
   beat=0               # 心跳计数器
 
-# 检查游戏进程是否存活（白名单内任一主包 pidof 命中）
+# 检查游戏进程是否存活
+# 优化：原实现对白名单逐个跑 pidof（53 次 fork），改为一次 ps 扫描 + grep 比对，
+#       子进程数从 ~53 降到 2，daemon 系统态 CPU 显著下降。
+#       注意：NAME 列是完整包名且带 :子进程 后缀，需先剥掉后缀再比对。
 check_game_alive() {
-  local line
-  while IFS= read -r line || [ -n "$line" ]; do
-    [ -z "$line" ] && continue
-    if [ -n "$(pidof "$line" 2>/dev/null)" ]; then
-      return 0
-    fi
-  done < "$GAMES"
+  [ -f "$GAMES" ] || return 1
+  local running gp stamp
+  gp="$HKOM_DIR/.gamepkgs"
+  stamp="$HKOM_DIR/.gamepkgs.stamp"
+  # 白名单包名清单带缓存：仅当 games.conf 变化时才重建（避免每轮都 grep+sort）
+  if [ ! -s "$gp" ] || [ "$(stat -c %Y "$GAMES" 2>/dev/null)" != "$(cat "$stamp" 2>/dev/null)" ]; then
+    grep -E '^[A-Za-z]' "$GAMES" 2>/dev/null | sort -u > "$gp"
+    stat -c %Y "$GAMES" 2>/dev/null > "$stamp"
+  fi
+  [ -s "$gp" ] || return 1
+  # 一次取全部进程名（剥 :子进程 后缀），一次 grep -Fxf 精确交集
+  running=$(ps -A -o NAME 2>/dev/null | sed 's/:.*//' | sort -u)
+  [ -z "$running" ] && return 1
+  printf '%s\n' "$running" | grep -Fxf "$gp" -q 2>/dev/null && return 0
   return 1
 }
 
