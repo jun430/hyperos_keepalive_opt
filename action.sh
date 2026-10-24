@@ -30,6 +30,9 @@ case "$cmd" in
     apply_reclaim_off
     apply_lmk
     apply_zram
+    apply_freezer
+    apply_max_cached
+    apply_keep_list
     log INF "配置应用完成"
     echo "applied"
     ;;

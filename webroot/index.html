@@ -364,8 +364,18 @@ nav a:active .ico{transform:scale(.85)}
           <input type="range" id="r_target" min="60" max="95" step="1" oninput="rangeOut('o_target',this)" onchange="saveRange('watermark_target',this)"><div class="desc">内存用到这个 % 时自动清一次缓存，让占用稳定在这个水平附近</div></div>
         <div class="range-row"><div class="head"><span class="name">迟滞（防抖动）</span><span class="out" id="o_hyst">5</span></div>
           <input type="range" id="r_hyst" min="1" max="15" step="1" oninput="rangeOut('o_hyst',this)" onchange="saveRange('watermark_hysteresis',this)"><div class="desc">清完后要降到「水位 − 此值」以下才停止清理，避免反复清理浪费电</div></div>
-        <div class="toggle-row"><div class="info"><div class="name">强力清理</div><div class="desc">开 = 连内核缓存对象一起清（更彻底但略卡顿），关 = 只清文件缓存（温和）</div></div>
-          <label class="switch"><input type="checkbox" id="c_droplevel" onchange="saveToggleLevel(this)"><span class="slider"></span></label></div>
+        <div class="range-row"><div class="head"><span class="name">单次回收内存量</span><span class="out" id="o_reclaim">64</span> MB</div>
+          <input type="range" id="r_reclaim" min="32" max="256" step="32" oninput="rangeOut('o_reclaim',this)" onchange="saveRange('reclaim_mb',this)"><div class="desc">每次主动清理时回收多少内存。小=更平滑但清得慢；大=清得快但单次开销高。推荐 64~128，不会造成 CPU 尖峰</div></div>
+      </div>
+    </section>
+
+    <section>
+      <div class="sec-title">后台冻结（不杀只冻）</div>
+      <div class="card glass">
+        <div class="toggle-row"><div class="info"><div class="name">启用系统原生冻结</div><div class="desc">开 = 后台进程冻结但不杀，点回去页面还在；微信/QQ 有消息/通知会自动解冻，不影响接收</div></div>
+          <label class="switch"><input type="checkbox" id="c_freezer" onchange="saveToggle('freezer_enable',this)"><span class="slider"></span></label></div>
+        <div class="range-row"><div class="head"><span class="name">缓存进程数量上限</span><span class="out" id="o_maxcached">64</span></div>
+          <input type="range" id="r_maxcached" min="16" max="128" step="8" oninput="rangeOut('o_maxcached',this)" onchange="saveRange('max_cached_procs',this)"><div class="desc">保留多少个后台在缓存态（冻结）而不是被直接杀掉。越大留得越多、点回 App 页面越不易丢，但占用内存也越高</div></div>
       </div>
     </section>
 
@@ -714,7 +724,9 @@ async function loadConf(){
   setChk('c_kill', map.game_kill_cached);
   setChk('c_dropgame', map.game_drop_caches);
   setChk('c_zram', map.zram_takeover);
-  setChk('c_droplevel', map.drop_level==='3');
+  setChk('c_freezer', map.freezer_enable);
+  setRange('r_reclaim', map.reclaim_mb || 64, 'o_reclaim');
+  setRange('r_maxcached', map.max_cached_procs, 'o_maxcached');
   setRange('r_critical', map.lmk_critical, 'o_critical');
   setRange('r_medium', map.lmk_medium, 'o_medium');
   setRange('r_low', map.lmk_low, 'o_low');
@@ -734,12 +746,6 @@ async function saveToggle(key, el){
   await execRet('set ' + key + ' ' + (el.checked?1:0));
   toast(key + ' = ' + (el.checked?1:0));
   await execRet('apply');
-}
-async function saveToggleLevel(el){
-  if(!hasKsu()){ toast('请在 KernelSU WebUI 中打开'); return; }
-  const v = el.checked ? 3 : 1;
-  await execRet('set drop_level ' + v);
-  toast('drop_level = ' + v);
 }
 async function saveRange(key, el){
   if(!hasKsu()) return;

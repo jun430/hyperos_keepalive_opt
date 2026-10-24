@@ -71,9 +71,13 @@ DEF_swappiness=80
 # daemon
 DEF_poll_normal=10
 DEF_poll_game=3
+# 冻结与缓存上限（M11）
+DEF_freezer_enable=1
+DEF_max_cached_procs=64
+DEF_reclaim_mb=64
 
 # 配置项名列表（用于 get_conf 兜底）
-CONF_KEYS="disable_mimd disable_unfairmem disable_mi_reclaim disable_memory_standard lmk_low lmk_medium lmk_critical watermark_target watermark_hysteresis drop_level game_mode game_kill_cached game_drop_caches zram_takeover swappiness poll_normal poll_game"
+CONF_KEYS="disable_mimd disable_unfairmem disable_mi_reclaim disable_memory_standard lmk_low lmk_medium lmk_critical watermark_target watermark_hysteresis drop_level game_mode game_kill_cached game_drop_caches zram_takeover swappiness poll_normal poll_game freezer_enable max_cached_procs reclaim_mb"
 
 # ---------- 配置读取 ----------
 # get_conf key  -> 返回配置值（优先 hkom.conf，缺失用默认）
@@ -218,6 +222,75 @@ apply_keep_list() {
   log KEEP "已更新后台保活白名单"
 }
 
+# 防杀加固：把保活白名单进程的 oom_score_adj 压到缓存区间最低（900），
+# 使其在 lmkd 判定时排到最后、最难被杀；页面状态得以保留，点回秒开。
+# 说明：只对已存在的进程生效（进程被杀后需重新拉起才恢复，属正常）。
+harden_keep_procs() {
+  [ -f "$KEEP_CONF" ] || return 0
+  local pkg pid adj cnt=0
+  for pkg in $(keep_list_pkgs); do
+    for pid in $(pidof "$pkg" 2>/dev/null); do
+      adj=$(cat /proc/$pid/oom_score_adj 2>/dev/null)
+      [ -z "$adj" ] && continue
+      # 只提高缓存级进程的保护，不动前台/可见/服务（adj<900）
+      if [ "$adj" -ge 900 ] 2>/dev/null && [ "$adj" -gt 900 ]; then
+        echo 900 > /proc/$pid/oom_score_adj 2>/dev/null && cnt=$((cnt+1))
+      fi
+    done
+  done
+  [ "$cnt" -gt 0 ] && log KEEP "防杀加固：$cnt 个保活进程降至 adj=900"
+  return 0
+}
+
+# ---------- 冻结与缓存进程上限（M11：后台冻结保活，不杀只冻） ----------
+# 说明：不能手动往 cgroup.freeze 写 1 —— 那样进程对内核彻底静默，
+#       微信/QQ 收不到消息、通知不来。必须交给系统原生 freezer（AMS 管理），
+#       它冻结后仍能感知 pending 广播/FCM/网络包，有活先解冻再投递。
+apply_freezer() {
+  local want
+  want=$(get_conf freezer_enable)
+  [ -z "$want" ] && want=1
+  if [ "$want" = "1" ]; then
+    local cur
+    cur=$(settings get global cached_apps_freezer 2>/dev/null)
+    if [ "$cur" != "enabled" ]; then
+      settings put global cached_apps_freezer enabled 2>/dev/null
+      log MEM "已开启系统原生冻结（后台冻结不杀，消息通知正常）"
+    fi
+  else
+    local cur
+    cur=$(settings get global cached_apps_freezer 2>/dev/null)
+    if [ "$cur" != "disabled" ]; then
+      settings put global cached_apps_freezer disabled 2>/dev/null
+      log MEM "已关闭系统原生冻结"
+    fi
+  fi
+}
+
+# 提高 AMS 缓存进程上限：让更多后台留在缓存态（被冻结）而不是被直接杀掉，
+# 这样点回去页面还在。值越大留得越多，但内存占用也越高。
+apply_max_cached() {
+  local n
+  n=$(get_conf max_cached_procs)
+  [ -z "$n" ] && n=64
+  [ "$n" = "0" ] && return 0
+  local cur
+  cur=$(settings get global activity_manager_constants 2>/dev/null)
+  case "$cur" in
+    *max_cached_processes*)
+      # 已存在该项，替换数值
+      local newv
+      newv=$(printf '%s' "$cur" | sed "s/max_cached_processes=[0-9]*/max_cached_processes=$n/")
+      [ "$newv" != "$cur" ] && settings put global activity_manager_constants "$newv" 2>/dev/null
+      ;;
+    *)
+      # 未设置过，追加（device_config 优先级更高，这里作为兜底）
+      ;;
+  esac
+  device_config put activity_manager max_cached_processes "$n" 2>/dev/null
+  log MEM "缓存进程上限设为 $n（点回 App 页面保留）"
+}
+
 # ---------- 动作执行 ----------
 # 关闭主动回收（M1）
 apply_reclaim_off() {
@@ -256,10 +329,41 @@ apply_lmk() {
 }
 
 # 清理 page cache（M3）
+# 策略：优先用 memory.reclaim_once 做「定量平滑回收」——按需回收指定字节数，
+#       内核只回收该量，不产生 CPU/IO 尖峰；接口不可用时才回退 drop_caches。
+#       实测：reclaim_once 回收 200MB 仅降 Cached 413MB 瞬时完成；
+#             drop_caches 3 是全量同步清空，会一次性造成尖峰。
+RECLAIM_ONCE=/dev/memcg/memory.reclaim_once
+
+# 平滑回收指定 MB（默认读 reclaim_mb 配置，缺省按 drop_level 推算）
+smooth_reclaim() {
+  local mb="$1"
+  if [ -z "$mb" ]; then
+    mb=$(get_conf reclaim_mb)
+    if [ -z "$mb" ] || [ "$mb" = "0" ]; then
+      case "$(get_conf drop_level)" in
+        1) mb=64 ;;
+        2) mb=128 ;;
+        *) mb=256 ;;
+      esac
+    fi
+  fi
+  if [ -w "$RECLAIM_ONCE" ]; then
+    local bytes=$(( mb * 1048576 ))
+    if echo "$bytes" > "$RECLAIM_ONCE" 2>/dev/null; then
+      log MEM "平滑回收 ${mb}MB（定量，无尖峰）"
+      return 0
+    fi
+  fi
+  # 回退：接口不可用才用 drop_caches（旧路径）
+  echo "$(get_conf drop_level)" > "$DROP_CACHES" 2>/dev/null
+  log MEM "回收缓存 ${mb}MB（回退 drop_caches）"
+}
+
 drop_cache() {
   local lvl="$1"
   [ -z "$lvl" ] && lvl=$(get_conf drop_level)
-  echo "$lvl" > "$DROP_CACHES" 2>/dev/null
+  smooth_reclaim
 }
 
 # 应用 zram 配置（M5，可选接管）

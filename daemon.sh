@@ -106,21 +106,29 @@ while :; do
     prev_game=0
   fi
 
-  # ---- 水位判定（M3，常态与游戏态都执行，但游戏态不因水位清缓存避免争抢）----
+  # ---- 水位判定（M3：提前主动清理，但定量渐进，避免 CPU/IO 尖峰）----
   mem_snapshot
   target=$(get_conf watermark_target)
   hyst=$(get_conf watermark_hysteresis)
   stop_at=$(( target - hyst ))
 
   if [ "$game_active" != "1" ]; then
-    # 常态：占用 > target 且上次未在迟滞区内，则清缓存
-    if [ "$MEM_USED_PCT" -ge "$target" ] && [ "$prev_drop" = "0" ]; then
-      lvl=$(get_conf drop_level)
-      drop_cache "$lvl"
-      log MEM "内存占用 ${MEM_USED_PCT}% 达到水位 ${target}%，已清理缓存 (级别=$lvl)"
+    # 常态：占用达到 target 就开始清理，且清理后不一次性清到底，
+    # 每轮只定量回收一小块（smooth_reclaim 按 drop_level 定 64/128/256MB），
+    # 直到占用降到 stop_at 以下才停。这样把回收摊平到多轮，无尖峰。
+    if [ "$MEM_USED_PCT" -ge "$target" ]; then
+      psiv=$(psi_avg300)
+      # PSI 已经很高说明系统真有压力 → 加大单次回收量；否则温和回收
+      if [ "${psiv%%.*}" -ge 10 ] 2>/dev/null; then
+        smooth_reclaim 256
+        log MEM "内存 ${MEM_USED_PCT}% 达水位 ${target}%，PSI ${psiv}% 偏高，回收 256MB"
+      else
+        smooth_reclaim
+        log MEM "内存 ${MEM_USED_PCT}% 达水位 ${target}%，平稳回收（PSI ${psiv}%）"
+      fi
       prev_drop=1
     elif [ "$MEM_USED_PCT" -le "$stop_at" ]; then
-      # 降到 stop_at 以下，退出迟滞区
+      # 降到 stop_at 以下，退出清理状态
       prev_drop=0
     fi
   fi
@@ -130,6 +138,8 @@ while :; do
   if [ "$reclaim_guard" -ge 5 ]; then
     reclaim_guard=0
     apply_reclaim_off
+    # 防杀加固：把保活白名单缓存进程的 adj 压到最低，降低被 lmkd 杀掉的概率
+    harden_keep_procs
   fi
 
   # ---- 心跳日志（每 30 轮一条，常态约 5 分钟/游戏态约 90 秒，证明 daemon 存活且在工作）----
