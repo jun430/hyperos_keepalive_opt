@@ -270,26 +270,35 @@ apply_freezer() {
 
 # 提高 AMS 缓存进程上限：让更多后台留在缓存态（被冻结）而不是被直接杀掉，
 # 这样点回去页面还在。值越大留得越多，但内存占用也越高。
+# 注意：device_config 是内存态配置，系统会在 AMS 重启/内存压力时重置，
+#       所以既写 device_config 也写 settings global 双通道，并由 daemon 定期兜底重写。
 apply_max_cached() {
   local n
   n=$(get_conf max_cached_procs)
   [ -z "$n" ] && n=64
   [ "$n" = "0" ] && return 0
-  local cur
-  cur=$(settings get global activity_manager_constants 2>/dev/null)
-  case "$cur" in
-    *max_cached_processes*)
-      # 已存在该项，替换数值
+
+  # 通道 1：device_config（AMS 优先读这个，但会被系统重置）
+  local cur_dc
+  cur_dc=$(device_config get activity_manager max_cached_processes 2>/dev/null)
+  if [ "$cur_dc" != "$n" ]; then
+    device_config put activity_manager max_cached_processes "$n" 2>/dev/null && \
+      log MEM "缓存进程上限=$n（device_config）"
+  fi
+
+  # 通道 2：settings global（持久化，重启后仍在）
+  local cur_sg
+  cur_sg=$(settings get global activity_manager_constants 2>/dev/null)
+  case "$cur_sg" in
+    *max_cached_processes=*)
       local newv
-      newv=$(printf '%s' "$cur" | sed "s/max_cached_processes=[0-9]*/max_cached_processes=$n/")
-      [ "$newv" != "$cur" ] && settings put global activity_manager_constants "$newv" 2>/dev/null
+      newv=$(printf '%s' "$cur_sg" | sed "s/max_cached_processes=[0-9]*/max_cached_processes=$n/")
+      [ "$newv" != "$cur_sg" ] && settings put global activity_manager_constants "$newv" 2>/dev/null
       ;;
     *)
-      # 未设置过，追加（device_config 优先级更高，这里作为兜底）
+      settings put global activity_manager_constants "max_cached_processes=$n" 2>/dev/null
       ;;
   esac
-  device_config put activity_manager max_cached_processes "$n" 2>/dev/null
-  log MEM "缓存进程上限设为 $n（点回 App 页面保留）"
 }
 
 # ---------- 动作执行 ----------

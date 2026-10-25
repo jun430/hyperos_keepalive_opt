@@ -150,6 +150,10 @@ while :; do
     apply_reclaim_off
     # 防杀加固：把保活白名单缓存进程的 adj 压到最低，降低被 lmkd 杀掉的概率
     harden_keep_procs
+    # 缓存进程上限兜底：device_config 会被系统重置，定期重写保证生效
+    apply_max_cached
+    # 冻结开关兜底：同样是持久化项，防止被系统改回
+    apply_freezer
   fi
 
   # ---- 心跳日志（每 30 轮一条，常态约 5 分钟/游戏态约 90 秒，证明 daemon 存活且在工作）----
