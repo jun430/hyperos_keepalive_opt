@@ -223,9 +223,17 @@ apply_keep_list() {
   log KEEP "已更新后台保活白名单"
 }
 
-# 防杀加固：把保活白名单进程的 oom_score_adj 压到缓存区间最低（900），
-# 使其在 lmkd 判定时排到最后、最难被杀；页面状态得以保留，点回秒开。
-# 说明：只对已存在的进程生效（进程被杀后需重新拉起才恢复，属正常）。
+# 内核级保活（M12）：把保活白名单进程的 oom_score_adj 强制设为 -900
+#
+# 原理：oom_score_adj 是内核 oom killer 与 lmkd 共同读取的判定依据，
+#       值越小越不可能被杀。-900 已低于 SystemUI 的 -800，属系统进程级保护；
+#       而 lmkd 三档阈值最低是 critical（本机 930），-900 永远不会被任何一档选中。
+#       因此这些进程不会被 LMK「清理缓存」时连带杀掉，只会正常释放其页缓存。
+#
+# 实测（2026-10-25）：root 可写负数 adj，写入 -900 成功并立即生效。
+#
+# 注意：adj 由 AMS 在进程状态变化时重新计算并覆写（如切前后台），
+#       所以需要在 daemon 里周期性重申，不能只设一次。
 harden_keep_procs() {
   [ -f "$KEEP_CONF" ] || return 0
   local pkg pid adj cnt=0
@@ -233,13 +241,13 @@ harden_keep_procs() {
     for pid in $(pidof "$pkg" 2>/dev/null); do
       adj=$(cat /proc/$pid/oom_score_adj 2>/dev/null)
       [ -z "$adj" ] && continue
-      # 只提高缓存级进程的保护，不动前台/可见/服务（adj<900）
-      if [ "$adj" -ge 900 ] 2>/dev/null && [ "$adj" -gt 900 ]; then
-        echo 900 > /proc/$pid/oom_score_adj 2>/dev/null && cnt=$((cnt+1))
+      # 已经是受保护级别就跳过，避免重复写
+      if [ "$adj" -gt -900 ] 2>/dev/null; then
+        echo -900 > /proc/$pid/oom_score_adj 2>/dev/null && cnt=$((cnt+1))
       fi
     done
   done
-  [ "$cnt" -gt 0 ] && log KEEP "防杀加固：$cnt 个保活进程降至 adj=900"
+  [ "$cnt" -gt 0 ] && log KEEP "内核级保活：$cnt 个进程设为 adj=-900（LMK 不再选中）"
   return 0
 }
 

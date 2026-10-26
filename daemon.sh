@@ -143,13 +143,16 @@ while :; do
     fi
   fi
 
-  # ---- 兜底：每 N 轮检查主动回收是否被重新拉起（M1 兜底，降低开销）----
+  # ---- 内核级保活（M12）：每轮重申 adj=-900 ----
+  # AMS 在进程状态变化（切前后台、bind 服务等）时会重新计算并覆写 oom_score_adj，
+  # 所以必须每轮重申，否则保护会被系统悄悄撤销。开销：每个白名单进程 1 次读写。
+  harden_keep_procs
+
+  # ---- 兜底：每 N 轮检查系统级配置是否被重置 ----
   reclaim_guard=$(( reclaim_guard + 1 ))
   if [ "$reclaim_guard" -ge 5 ]; then
     reclaim_guard=0
     apply_reclaim_off
-    # 防杀加固：把保活白名单缓存进程的 adj 压到最低，降低被 lmkd 杀掉的概率
-    harden_keep_procs
     # 缓存进程上限兜底：device_config 会被系统重置，定期重写保证生效
     apply_max_cached
     # 冻结开关兜底：同样是持久化项，防止被系统改回
