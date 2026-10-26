@@ -249,6 +249,14 @@ is_system_pkg() {
     *.*) ;;
     *) return 0 ;;
   esac
+  # ★ 推送通道例外必须在「查缓存」之前判定：
+  #   com.xiaomi.xmsf / com.xiaomi.xmsfkeeper 本身是预装系统应用，
+  #   会同时出现在 .syspkgs 缓存里（实测第 388/389 行）。
+  #   若先查缓存，命中即 return 0，推送例外分支永远走不到，
+  #   导致小米推送通道拿不到 -900，离线消息可能丢。
+  case "$p" in
+    com.xiaomi.xmsf|com.xiaomi.xmsfkeeper) return 1 ;;
+  esac
   if [ -s "$SYS_PKG_CACHE" ] && grep -qxF "$p" "$SYS_PKG_CACHE" 2>/dev/null; then
     return 0
   fi
