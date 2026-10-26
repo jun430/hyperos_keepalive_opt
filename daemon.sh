@@ -12,6 +12,14 @@ if ! lock_instance "$DAEMON_PID"; then
   exit 0
 fi
 
+# ★ 自身提权（熄屏存活关键）：
+# 实测熄屏后 daemon 的 sleep 1 会被拉长，心跳间隔从配置的 300s 膨胀到
+# 468~547s（7.8~9.1 分钟）。原因是 daemon 以普通 oom_score_adj=50 运行在
+# /top-app cgroup，熄屏后系统把后台 CPU 预算收紧、timer slack 放大，
+# sleep 精度下降，导致 AMS 覆写 adj 后长时间无人补写，应用被 LMK 杀掉。
+# 对策：把 daemon 自身设为 -1000（不可回收级），只要内核活着它就不被杀。
+echo -1000 > /proc/$$/oom_score_adj 2>/dev/null
+
 log INF "守护进程启动 pid=$$"
 set_status daemon "running"
 
@@ -183,19 +191,38 @@ while :; do
 
   # ---- 惰性轮询间隔（分段 sleep，期间轻量看护消息通道 adj）----
   # AMS 会在两轮之间覆写消息通道 adj（实测 :MSF 被写回 500），
-  # 把 sleep 切成 2 秒一段、每段重申一次，把空窗期从 10s 缩短到 ~2s。
+  # 把 sleep 切成 1 秒一段、每段重申一次，把空窗期从 10s 缩短到 ~1s。
   # 每段只做「读缓存 PID 的 adj → 若被抬高则写回」，不扫 ps，开销 1~2ms。
+  #
+  # ★ 时间基准改为 date 绝对值（熄屏关键）：
+  #   原实现用 slept 计数器累加，`sleep 1` 实际会被系统拉长（熄屏后 timer slack
+  #   放大到数秒），计数器按「次数」算而不管真实耗时 → 一轮远超 nap 秒。
+  #   实测心跳间隔从配置的 300s 膨胀到 468~547s。
+  #   改为记录起始时间戳，用真实经过秒数判定，无论 sleep 被拉长多少，
+  #   这一轮循环一定在 nap 秒左右结束（误差 ≤ 一次 sleep 的实际值）。
   if [ "$game_active" = "1" ]; then
     nap=$(get_conf poll_game)
   else
     nap=$(get_conf poll_normal)
   fi
   [ "$nap" -lt 2 ] 2>/dev/null && nap=2
-  slept=0
-  while [ "$slept" -lt "$nap" ]; do
+  # ★ 熄屏期间把轮询间隔压到 3 秒：
+  #   熄屏后 AMS 会批量把后台应用 adj 重算到 idle 级别（缓存级 900+），
+  #   同时系统收紧 CPU / timer slack，若仍按 10 秒轮询，
+  #   覆写窗口内应用已可能被 LMK 选中杀掉——这正是「熄屏一段时间后台就没了」的原因。
+  #   压到 3 秒把窗口缩小 3 倍，代价只是熄屏时多几次 /proc 读取（每次 <1ms）。
+  SCREEN_OFF=0
+  if is_screen_off; then
+    SCREEN_OFF=1
+    [ "$nap" -gt 3 ] && nap=3
+  fi
+  nap_start=$(date +%s)
+  while :; do
     msg_guard
+    # 每段只睡 1 秒；若被系统拉长，下一轮用真实耗时判断就能及时退出
     sleep 1
-    slept=$((slept + 1))
+    nap_now=$(date +%s)
+    [ $((nap_now - nap_start)) -ge "$nap" ] && break
   done
 done
 

@@ -453,16 +453,59 @@ EOF
 msg_guard() {
   [ -z "$MSG_PIDS" ] && refresh_msg_pids
   [ -z "$MSG_PIDS" ] && return 0
-  local pid adj stale=0
+  local pid adj stale=0 fixed=0
   for pid in $MSG_PIDS; do
     adj=$(cat /proc/$pid/oom_score_adj 2>/dev/null)
     if [ -z "$adj" ]; then stale=1; continue; fi
     if [ "$adj" -gt -900 ] 2>/dev/null; then
-      echo -900 > /proc/$pid/oom_score_adj 2>/dev/null
+      echo -900 > /proc/$pid/oom_score_adj 2>/dev/null && fixed=$((fixed + 1))
     fi
   done
+  # ★ 熄屏期间补守主进程：
+  #   熄屏后 AMS 会批量把全部后台应用重算到 idle 级别（缓存级 900+），
+  #   光守消息通道不够——主进程被覆写后就成了 LMK 首选目标，
+  #   表现为「熄屏一段时间再打开，App 已经回到首页」。
+  #   这里在熄屏时对全部受保护进程重申一遍 adj；亮屏不做，避免无谓开销。
+  #
+  # ★ 必须自己过滤系统包：list_protected_pids 只按 UID>=10000 枚举，
+  #   不过滤系统应用（实测输出里含 com.android.camera / com.miui.analytics
+  #   / android.ext.services / bash / [logcat] 等）。系统包过滤原本只在
+  #   smart_keep 里做，这里若不补过滤就会给系统进程也写 -900，
+  #   违反「只动第三方 App」的约束。
+  if [ "$SCREEN_OFF" = "1" ]; then
+    local b p a
+    while read -r b p; do
+      [ -z "$p" ] && continue
+      is_system_pkg "$b" && continue
+      a=$(cat /proc/$p/oom_score_adj 2>/dev/null)
+      [ -z "$a" ] && continue
+      if [ "$a" -gt -900 ] 2>/dev/null; then
+        echo -900 > /proc/$p/oom_score_adj 2>/dev/null
+      fi
+    done <<EOF
+$(list_protected_pids | awk '$4 == 0 {print $1, $2}')
+EOF
+  fi
   [ "$stale" = "1" ] && refresh_msg_pids
   return 0
+}
+
+# 判断屏幕是否熄灭（熄屏后系统会大幅收紧后台调度，需特殊处理）
+# 用 backlight 亮度=0 判定，纯文件读取，比 dumpsys power 稳定。
+# 结果缓存在 SCREEN_OFF 变量里，避免每段轮询都读文件。
+# 返回 0 = 熄屏，1 = 亮屏，2 = 无法判定（当作亮屏处理）
+is_screen_off() {
+  local b
+  b=$(cat /sys/class/backlight/panel0-backlight/brightness 2>/dev/null)
+  if [ -z "$b" ]; then
+    # 节点不存在，退回 dumpsys 判定
+    case "$(dumpsys power 2>/dev/null | grep -m1 'mWakefulness=')" in
+      *Awake*|"") return 1 ;;
+      *) return 0 ;;
+    esac
+  fi
+  [ "$b" = "0" ] && return 0
+  return 1
 }
 
 # ---------- 后台超时杀子进程（M15）----------
@@ -529,6 +572,13 @@ EOF
 
   # 3. 检查超时，杀掉对应包的子进程（保留主进程 + 消息通道）
   #    注意：先把待处理清单快照到临时文件，避免循环内重写 BGWORK 导致读脏
+  # ★ 快照前先去重：同一包若有多行记录（历史遗留 / 并发写入），
+  #   会导致同一个包被处理多次——重复 kill 同一个已死的 pid 属无害，
+  #   但会浪费一轮 ps 扫描，且让「清理几个子进程」的统计翻倍。
+  #   保留每个包最早的那条（比保留最晚的更保守：早记录意味着更早超时）。
+  if [ -s "$BGWORK" ]; then
+    awk '!seen[$1]++' "$BGWORK" > "$BGWORK.dedup" 2>/dev/null && mv -f "$BGWORK.dedup" "$BGWORK"
+  fi
   cp -f "$BGWORK" "$BGWORK.snap" 2>/dev/null || : > "$BGWORK.snap"
   # ★ 存活判定不能用 pidof：pidof 只认主进程，主进程被系统杀掉后
   #   子进程仍存活时 pidof 返回空，会被误判为「已不在后台」而清掉计时，
