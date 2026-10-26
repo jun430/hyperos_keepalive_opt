@@ -77,9 +77,12 @@ DEF_freezer_enable=1
 DEF_max_cached_procs=64
 DEF_reclaim_mb=64
 DEF_smart_keep=1
+# 后台超时杀子进程（M15）
+# 0 = 关闭；单位分钟。App 退到后台超过该时长后，杀掉它的 :子进程（主进程保留）
+DEF_bg_child_kill=5
 
 # 配置项名列表（用于 get_conf 兜底）
-CONF_KEYS="disable_mimd disable_unfairmem disable_mi_reclaim disable_memory_standard lmk_low lmk_medium lmk_critical watermark_target watermark_hysteresis drop_level game_mode game_kill_cached game_drop_caches zram_takeover swappiness poll_normal poll_game freezer_enable max_cached_procs reclaim_mb watermark_scale_factor smart_keep"
+CONF_KEYS="disable_mimd disable_unfairmem disable_mi_reclaim disable_memory_standard lmk_low lmk_medium lmk_critical watermark_target watermark_hysteresis drop_level game_mode game_kill_cached game_drop_caches zram_takeover swappiness poll_normal poll_game freezer_enable max_cached_procs reclaim_mb watermark_scale_factor smart_keep bg_child_kill"
 
 # ---------- 配置读取 ----------
 # get_conf key  -> 返回配置值（优先 hkom.conf，缺失用默认）
@@ -185,8 +188,10 @@ is_sys_pkg() {
   return 1
 }
 
-# 读取 keep.conf 所有包名（空格分隔，供 JSON 拼接）
-# ★ 内置系统包过滤：即使配置里误加系统包，也不会进入保活处理链。
+# 读取 keep.conf 所有包名（空格分隔）
+# ★ 白名单语义已变更（M14）：
+#   不再是「哪些 App 要保护」——现在所有第三方 App 进程都保护。
+#   白名单只表示「这些 App 的消息进程即使被划掉后台也要继续保护」。
 keep_list_pkgs() {
   [ -f "$KEEP_CONF" ] || return 0
   local l out=""
@@ -195,6 +200,84 @@ keep_list_pkgs() {
     out="$out $l"
   done
   echo "$out"
+}
+
+# ---------- 内核级保活（M14）：保护全部第三方 App 进程 ----------
+# 语义（按用户要求）：
+#   - 不需要白名单。全部第三方 App 进程只要存活就设 adj=-900。
+#   - 用户划掉后台 → 系统 SwipeUpClean 杀进程 → 进程消失 → 保护自然解除。
+#   - 白名单只用于标记「消息进程划掉后台后仍要继续保护」的 App
+#     （否则 QQ/微信划掉后收不到消息）。
+#   - 系统应用一律不动：按 pm list packages -s（系统分区应用）排除，
+#     不能只看 UID —— 很多系统组件（com.milink.service / com.qti.phone 等）
+#     UID 也 >=10000，但装在 /system_ext、/product 下，属于系统应用。
+
+SYS_PKG_CACHE=$HKOM_DIR/.syspkgs
+SYS_PKG_STAMP=$HKOM_DIR/.syspkgs.stamp
+
+# 刷新系统应用清单缓存
+# ★ 两个来源合并，缺一不可：
+#   1) pm list packages -s          → 标准系统分区应用（/system /system_ext /product /vendor）
+#   2) pm path 落在系统分区的预装应用 → 部分预装 App（如 com.miui.calculator 在
+#      /product/data-app/）不被 -s 收录，但同样是系统预装，不该被我们接管。
+#   另外补充小米/高通/运营商等系统包前缀，防止漏网。
+refresh_sys_pkgs() {
+  pm list packages -s 2>/dev/null | sed 's/^package://' > "$SYS_PKG_CACHE.tmp" 2>/dev/null
+  # 补充：预装在系统目录但不算 -s 的应用
+  pm list packages -f 2>/dev/null \
+    | grep -E '^package:/(system|system_ext|product|vendor|odm)/' \
+    | sed 's/.*=//' >> "$SYS_PKG_CACHE.tmp" 2>/dev/null
+  if [ -s "$SYS_PKG_CACHE.tmp" ]; then
+    sort -u "$SYS_PKG_CACHE.tmp" > "$SYS_PKG_CACHE" 2>/dev/null
+    rm -f "$SYS_PKG_CACHE.tmp"
+    date +%s > "$SYS_PKG_STAMP" 2>/dev/null
+  else
+    rm -f "$SYS_PKG_CACHE.tmp"
+  fi
+}
+
+# 判断包是否为系统应用（缓存清单 + 前缀兜底）
+is_system_pkg() {
+  local p="$1"
+  # 非法包名（"system" / "bash" / "[logcat]" / ".qms" 这类非包名进程）→ 当作要跳过
+  case "$p" in
+    *[!A-Za-z0-9._]*) return 0 ;;
+    .*|"") return 0 ;;
+  esac
+  # 至少含一个点，且形如 xxx.yyy 才是包名
+  case "$p" in
+    *.*) ;;
+    *) return 0 ;;
+  esac
+  if [ -s "$SYS_PKG_CACHE" ] && grep -qxF "$p" "$SYS_PKG_CACHE" 2>/dev/null; then
+    return 0
+  fi
+  is_sys_pkg "$p"
+}
+
+# 枚举应受保护的进程：输出 "包名 PID 进程名 是否子进程 是否白名单"
+list_protected_pids() {
+  local wl
+  wl=$(keep_list_pkgs)
+  ps -A -o PID,UID,NAME 2>/dev/null | awk -v WL="$wl" '
+    BEGIN {
+      n = split(WL, a, " ")
+      for (i = 1; i <= n; i++) if (a[i] != "") wl[a[i]] = 1
+    }
+    {
+      pid = $1; uid = $2
+      if (pid !~ /^[0-9]+$/) next
+      if (uid + 0 < 10000) next          # 内核/系统 daemon 一律跳过
+      name = $0
+      sub(/^[ \t]*[0-9]+[ \t]+[0-9]+[ \t]+/, "", name)
+      sub(/[ \t]+$/, "", name)
+      base = name
+      sub(/:.*/, "", base)
+      if (base == "") next
+      ch = (name ~ /:/) ? 1 : 0
+      w  = (base in wl) ? 1 : 0
+      print base, pid, name, ch, w
+    }'
 }
 
 # 应用保活白名单 → 系统 locked_apps
@@ -310,25 +393,23 @@ recents_pkgs() {
     | sort -u | tr '\n' ' '
 }
 
-# 判断是否为「消息推送通道」进程（必须永不撤销保护）
-# 依据真实进程名匹配，覆盖常见 IM / 推送框架：
-#   QQ      :MSF（消息服务框架）、:peak、:openSdk、:qzone
-#   微信    :push、:appbrand0/1/2、:exdevice、:service、:tools、:sandbox
-#   通用    :push、:remote、:msf、:daemon、:xmsf、:mipush、:pushservice
-# 这些进程一旦被杀，即使主进程还活着也收不到消息，因此不参与撤销。
+# 判断是否为「消息推送通道」进程 —— 严格白名单，只认真正的推送/消息长连接
+# ★ 必须严格：这个函数决定哪些进程「永不回收」。
+#   实测教训：早前把 *":appbrand"* / *":tools"* / *":sandbox"* 也纳入，
+#   结果微信 :appbrand0 629MB + :appbrand1 316MB（小程序容器）被永久保护，
+#   945MB 内存白占 —— 它们不是消息通道，小程序退出后应当回收。
+# 只保留真正承担「收消息 / 保活推送长连接」的进程：
 is_msg_channel() {
   case "$1" in
-    # 小米推送（系统级统一推送通道，主进程与子进程全部纳入）
+    # 小米推送（系统级统一推送，第三方 App 离线消息都经它投递）
     com.xiaomi.xmsf|com.xiaomi.xmsf:*|com.xiaomi.xmsfkeeper*) return 0 ;;
-    com.xiaomi.mipush*|*":mipush"*) return 0 ;;
-    # QQ
-    *":MSF"*|*":peak"*|*":openSdk"*|*":qzone"*) return 0 ;;
-    # 微信 / 通用推送
-    *":push"*|*":PushService"*|*":pushservice"*) return 0 ;;
-    *":appbrand"*) return 0 ;;
-    *":exdevice"*|*":sandbox"*|*":tools"*) return 0 ;;
-    *":msf"*|*":xmsf"*) return 0 ;;
-    *":remote"*|*":daemon"*|*":service"*) return 0 ;;
+    com.xiaomi.mipush*) return 0 ;;
+    # QQ：MSF = 消息服务框架（唯一天消息通道）
+    *":MSF"*|*":msf"*) return 0 ;;
+    # 微信：push = 消息推送通道
+    *":push"*|*":PushService"*) return 0 ;;
+    # 通用推送框架
+    *":mipush"*|*":pushservice"*) return 0 ;;
   esac
   return 1
 }
@@ -342,106 +423,170 @@ is_msg_channel() {
 # 缓存失效（进程重启/消失）时置空，下一段自动完整重扫。
 MSG_PIDS=""
 
-# 完整扫描并刷新消息通道 PID 缓存
-# 判定链：is_msg_channel（消息通道特征） + is_sys_pkg 过滤（系统进程不动，xmsf 例外放行）
+# 刷新「受保护进程」PID 缓存：只收录第三方进程（主进程 + 子进程），系统应用排除
 refresh_msg_pids() {
-  if [ ! -f "$KEEP_CONF" ]; then MSG_PIDS=""; return 0; fi
-  local nm pid out=""
-  while read -r nm pid; do
+  local base pid name ch w out=""
+  while read -r base pid name ch w; do
     [ -z "$pid" ] && continue
-    is_msg_channel "$nm" || continue
-    if is_sys_pkg "$nm"; then continue; fi
+    if is_system_pkg "$base"; then continue; fi
     out="$out $pid"
   done <<EOF
-$(ps -A -o PID,NAME 2>/dev/null | awk '
-  /:/ || /com\.xiaomi\.xmsf/ || /com\.xiaomi\.xmsfkeeper/ {
-    pid = $1
-    if (pid !~ /^[0-9]+$/) next
-    n = $0
-    sub(/^[ \t]*[0-9]+[ \t]+/, "", n)
-    sub(/[ \t]+$/, "", n)
-    print n, pid
-  }')
+$(list_protected_pids)
 EOF
   MSG_PIDS="$out"
 }
 
-# 轻量重申：只保证已缓存的消息通道 PID 维持 adj=-900
+# 轻量重申：把缓存 PID 的 adj 拉回 -900
+# 抵消 AMS 覆写（实测主进程 adj 会被短暂抬到 700~701，若恰逢 lmkd 采样就被杀）
 msg_guard() {
   [ -z "$MSG_PIDS" ] && refresh_msg_pids
   [ -z "$MSG_PIDS" ] && return 0
-  local pid adj kept=0 stale=0
+  local pid adj stale=0
   for pid in $MSG_PIDS; do
     adj=$(cat /proc/$pid/oom_score_adj 2>/dev/null)
     if [ -z "$adj" ]; then stale=1; continue; fi
     if [ "$adj" -gt -900 ] 2>/dev/null; then
-      echo -900 > /proc/$pid/oom_score_adj 2>/dev/null && kept=$((kept+1))
+      echo -900 > /proc/$pid/oom_score_adj 2>/dev/null
     fi
   done
   [ "$stale" = "1" ] && refresh_msg_pids
   return 0
 }
 
-# 智能保活：按 recents 状态动态设置/撤销 adj=-900
-# ★ 进程枚举走 keep_pids_of（ps+awk 单次扫描），覆盖 :MSF / :push / :peak 等子进程。
-#   pidof 只返回主进程，用它会导致子进程（消息通道）长期不受保护而被 LMK 杀掉。
-# ★ 撤销策略（M13.1）：
-#   主进程              → 划掉后撤销，回 400（缓存级，可被回收）
-#   消息通道子进程      → 永不撤销，始终保持 -900（收消息不能断）
-#   其它普通子进程      → 划掉后回 800（服务级，可回收但不优先杀）
-smart_keep() {
-  [ -f "$KEEP_CONF" ] || return 0
-  # 关闭智能模式时退回「全部固定保护」
-  if [ "$(get_conf smart_keep)" != "1" ]; then
-    harden_keep_procs
-    return 0
+# ---------- 后台超时杀子进程（M15）----------
+# 目的：App 退到后台一段时间后，回收它的 :子进程内存（:push/:MSF/:sandbox 等），
+#       主进程保留 —— 页面和状态不丢，重进不用冷启动，但能腾出可观内存。
+# 依据：实测 QQ 的 :MSF / :peak 各占 700MB~1.2GB，微信 :push 也有数百 MB。
+# 前提：白名单 App 的消息通道（is_msg_channel）不杀，否则收不到消息。
+# 状态：用文件记录「该包首次被观察到在后台的时间戳」，回到前台即清除。
+
+BGWORK=$HKOM_DIR/.bgtime
+
+# 取当前前台包名（dumpsys activity activities 约 23ms，是全机最快且稳定的方式）
+foreground_pkg() {
+  dumpsys activity activities 2>/dev/null \
+    | grep -m1 'topResumedActivity' \
+    | grep -oE 'u0 [a-zA-Z0-9_.]+/' \
+    | sed 's/^u0 //;s|/$||'
+}
+
+# 后台超时回收：对每个第三方 App 的子进程做超时判定
+# 调用频率：每 bg_check_every 轮一次（默认 6 轮 ≈ 1 分钟），不必每轮都查
+bg_child_reaper() {
+  local mins
+  mins=$(get_conf bg_child_kill)
+  case "$mins" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$mins" -le 0 ] 2>/dev/null && return 0
+
+  [ -f "$BGWORK" ] || : > "$BGWORK"
+
+  local fg base pid name ch w now ts elapsed
+  fg=$(foreground_pkg)
+  now=$(date +%s)
+  local limit=$((mins * 60))
+  local killed=0
+
+  # 1. 前台包 → 清除它的后台计时（回到前台立即重置）
+  if [ -n "$fg" ]; then
+    grep -v "^$fg " "$BGWORK" > "$BGWORK.tmp" 2>/dev/null && mv -f "$BGWORK.tmp" "$BGWORK"
   fi
 
-  local recents
-  recents=$(recents_pkgs)
-  local pids
-  pids=$(keep_pids_of)
-  [ -z "$pids" ] && return 0
-
-  local base pid adj prot=0 unprot=0 keepch=0 cname revadj
-  while read -r base pid; do
+  # 2. 遍历全部第三方进程，给「有子进程的包」记账
+  #    只有存在 :子进程 的包才值得计时（没有子进程就没什么可回收，不必记账）
+  local has_child
+  # ★ 必须把换行转成空格：case 用的是 " $has_child " 空格边界匹配，
+  #   若 has_child 内部是换行分隔则永远匹配不到（曾导致计时恒为 0 的 bug）
+  has_child=$(list_protected_pids | awk '$4 == 1 {print $1}' | sort -u | tr '\n' ' ')
+  while read -r base pid name ch w; do
     [ -z "$pid" ] && continue
+    if is_system_pkg "$base"; then continue; fi
+    [ "$ch" = "1" ] && continue          # 只按主进程记账
+    [ "$base" = "$fg" ] && continue       # 当前前台，不记
+    # 该包没有任何子进程 → 跳过（没有可回收对象）
+    case " $has_child " in *" $base "*) ;; *) continue ;; esac
+    # 首次见到该包在后台 → 记下时间
+    if ! grep -q "^$base " "$BGWORK" 2>/dev/null; then
+      echo "$base $now" >> "$BGWORK"
+    fi
+  done <<EOF
+$(list_protected_pids)
+EOF
+
+  # 3. 检查超时，杀掉对应包的子进程（保留主进程 + 消息通道）
+  #    注意：先把待处理清单快照到临时文件，避免循环内重写 BGWORK 导致读脏
+  cp -f "$BGWORK" "$BGWORK.snap" 2>/dev/null || : > "$BGWORK.snap"
+  local pkg
+  while read -r pkg ts; do
+    [ -z "$pkg" ] && continue
+    [ -z "$ts" ] && continue
+    elapsed=$((now - ts))
+    # 该包已不在后台（被杀/未运行/回到前台）→ 清掉计时
+    if ! pidof "$pkg" >/dev/null 2>&1; then
+      grep -v "^$pkg " "$BGWORK" > "$BGWORK.tmp" 2>/dev/null && mv -f "$BGWORK.tmp" "$BGWORK"
+      continue
+    fi
+    if [ "$elapsed" -lt "$limit" ]; then continue; fi
+    # 逐个子进程杀（主进程不动，消息通道不动）
+    list_protected_pids | awk -v P="$pkg" '$1 == P && $4 == 1 {print $2, $3}' > "$BGWORK.kill" 2>/dev/null
+    local p2 n2 nkill=0
+    while read -r p2 n2; do
+      [ -z "$p2" ] && continue
+      is_msg_channel "$n2" && continue           # 消息通道保留
+      kill -9 "$p2" 2>/dev/null && nkill=$((nkill + 1))
+    done < "$BGWORK.kill"
+    rm -f "$BGWORK.kill"
+    killed=$((killed + nkill))
+    [ "$nkill" -gt 0 ] && log MEM "后台超时 ${mins} 分钟：回收 $pkg 的 $nkill 个子进程（主进程保留）"
+    grep -v "^$pkg " "$BGWORK" > "$BGWORK.tmp" 2>/dev/null && mv -f "$BGWORK.tmp" "$BGWORK"
+  done < "$BGWORK.snap"
+  rm -f "$BGWORK.snap"
+
+  [ "$killed" -gt 0 ] && log MEM "后台超时回收共清理 $killed 个子进程"
+  return 0
+}
+
+# ---------- 内核级保活（M14）----------
+# 规则（不需要白名单）：
+#   1. 全部第三方 App 进程（UID>=10000）只要存活 → adj=-900
+#   2. 用户划掉后台 → 系统 SwipeUpClean 杀进程 → 进程消失 → 保护自动解除
+#   3. 白名单内的 App → 其消息通道子进程（:MSF/:push 等）额外常驻保护
+#      用于"划掉后台后消息进程继续收消息"；白名单不再决定"哪个 App 被保护"
+#   4. 系统进程（UID<10000）一律不动
+smart_keep() {
+  local base pid name ch w
+  local prot=0 keepch=0 adj
+
+  # 系统应用清单缓存过期（>6h 或不存在）时刷新，避免每轮都跑 pm
+  if [ ! -s "$SYS_PKG_CACHE" ]; then
+    refresh_sys_pkgs
+  fi
+
+  while read -r base pid name ch w; do
+    [ -z "$pid" ] && continue
+    # 系统应用一律不动（按 pm 系统分区清单判定，不能只看 UID）
+    if is_system_pkg "$base"; then continue; fi
+
     adj=$(cat /proc/$pid/oom_score_adj 2>/dev/null)
     [ -z "$adj" ] && continue
-    cname=$(tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null)
 
-    if is_msg_channel "$cname"; then
-      # 消息通道：无论是否在最近任务，始终锁死 -900
+    # 白名单 App 的消息通道子进程：常驻保护（划掉后台也不撤）
+    if [ "$w" = "1" ] && [ "$ch" = "1" ] && is_msg_channel "$name"; then
       if [ "$adj" -gt -900 ] 2>/dev/null; then
         echo -900 > /proc/$pid/oom_score_adj 2>/dev/null && keepch=$((keepch+1))
       fi
       continue
     fi
 
-    case " $recents " in
-      *" $base "*)
-        # 该包在最近任务中 → 保活（主进程 + 普通子进程都设 adj=-900）
-        if [ "$adj" -gt -900 ] 2>/dev/null; then
-          echo -900 > /proc/$pid/oom_score_adj 2>/dev/null && prot=$((prot+1))
-        fi
-        ;;
-      *)
-        # 已划出最近任务 → 撤销保护，交回系统
-        # 主进程回 400（缓存级）；普通子进程回 800（服务级）
-        if [ "$adj" -le -900 ] 2>/dev/null; then
-          revadj=400
-          case "$cname" in *:*) revadj=800 ;; esac
-          echo "$revadj" > /proc/$pid/oom_score_adj 2>/dev/null && unprot=$((unprot+1))
-        fi
-        ;;
-    esac
+    # 其余第三方进程：存活即保护
+    if [ "$adj" -gt -900 ] 2>/dev/null; then
+      echo -900 > /proc/$pid/oom_score_adj 2>/dev/null && prot=$((prot+1))
+    fi
   done <<EOF
-$pids
+$(list_protected_pids)
 EOF
-  # 只在有变化时打日志，避免刷屏
-  [ "$keepch" -gt 0 ] && log KEEP "消息通道保活：$keepch 个推送通道常驻 adj=-900（不收不到消息）"
-  [ "$prot" -gt 0 ] && log KEEP "智能保活：$prot 个进程保护中（在最近任务）"
-  [ "$unprot" -gt 0 ] && log KEEP "智能保活：$unprot 个进程撤销保护（已划出最近任务）"
+
+  [ "$keepch" -gt 0 ] && log KEEP "消息通道常驻：$keepch 个（白名单App，划掉后台仍保护）"
+  [ "$prot" -gt 0 ] && log KEEP "内核级保活：$prot 个后台进程设为 adj=-900"
   return 0
 }
 

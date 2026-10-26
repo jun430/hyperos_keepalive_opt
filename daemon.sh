@@ -20,6 +20,7 @@ prev_drop=0          # 上一次是否因水位清过缓存（迟滞用）
   game_active=0        # 当前游戏态
   prev_game=0          # 上一轮游戏态（用于检测游戏进入/退出沿）
   reclaim_guard=0      # 主动回收兜底计数器（每 N 轮执行一次，降开销）
+  bg_guard=0           # 后台超时杀子进程计数器（每 6 轮一次）
   beat=0               # 心跳计数器
 
 # 检查游戏进程是否存活
@@ -147,6 +148,14 @@ while :; do
   # 在最近任务中 → 保护；用户划掉 → 撤销保护。AMS 会覆写 adj，需每轮重申。
   smart_keep
 
+  # ---- 后台超时杀子进程（M15）：每 6 轮检查一次（约 1 分钟）----
+  # 只杀 :子进程，主进程保留，页面不丢；白名单 App 的消息通道不杀。
+  bg_guard=$(( bg_guard + 1 ))
+  if [ "$bg_guard" -ge 6 ]; then
+    bg_guard=0
+    bg_child_reaper
+  fi
+
   # ---- 兜底：每 N 轮检查系统级配置是否被重置 ----
   reclaim_guard=$(( reclaim_guard + 1 ))
   if [ "$reclaim_guard" -ge 5 ]; then
@@ -185,8 +194,8 @@ while :; do
   slept=0
   while [ "$slept" -lt "$nap" ]; do
     msg_guard
-    sleep 2
-    slept=$((slept + 2))
+    sleep 1
+    slept=$((slept + 1))
   done
 done
 
