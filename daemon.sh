@@ -143,10 +143,9 @@ while :; do
     fi
   fi
 
-  # ---- 内核级保活（M12）：每轮重申 adj=-900 ----
-  # AMS 在进程状态变化（切前后台、bind 服务等）时会重新计算并覆写 oom_score_adj，
-  # 所以必须每轮重申，否则保护会被系统悄悄撤销。开销：每个白名单进程 1 次读写。
-  harden_keep_procs
+  # ---- 智能保活（M13）：按"是否在最近任务"动态决定 adj=-900 ----
+  # 在最近任务中 → 保护；用户划掉 → 撤销保护。AMS 会覆写 adj，需每轮重申。
+  smart_keep
 
   # ---- 兜底：每 N 轮检查系统级配置是否被重置 ----
   reclaim_guard=$(( reclaim_guard + 1 ))
@@ -173,12 +172,22 @@ while :; do
   set_status psi300 "$(psi_avg300)"
   set_status updated_at "$(date '+%F %T')"
 
-  # ---- 惰性轮询间隔 ----
+  # ---- 惰性轮询间隔（分段 sleep，期间轻量看护消息通道 adj）----
+  # AMS 会在两轮之间覆写消息通道 adj（实测 :MSF 被写回 500），
+  # 把 sleep 切成 2 秒一段、每段重申一次，把空窗期从 10s 缩短到 ~2s。
+  # 每段只做「读缓存 PID 的 adj → 若被抬高则写回」，不扫 ps，开销 1~2ms。
   if [ "$game_active" = "1" ]; then
-    sleep "$(get_conf poll_game)"
+    nap=$(get_conf poll_game)
   else
-    sleep "$(get_conf poll_normal)"
+    nap=$(get_conf poll_normal)
   fi
+  [ "$nap" -lt 2 ] 2>/dev/null && nap=2
+  slept=0
+  while [ "$slept" -lt "$nap" ]; do
+    msg_guard
+    sleep 2
+    slept=$((slept + 2))
+  done
 done
 
 # 不应到达这里

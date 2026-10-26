@@ -175,8 +175,8 @@ KEEP_CONF=$HKOM_DIR/keep.conf
 #       所有第三方 App 的离线推送都经它投递，允许纳入内核级保护。
 is_sys_pkg() {
   case "$1" in
-    # 推送通道例外（允许保护）
-    com.xiaomi.xmsf|com.xiaomi.xmsfkeeper) return 1 ;;
+    # 推送通道例外（允许保护）：主进程与全部 :子进程
+    com.xiaomi.xmsf|com.xiaomi.xmsf:*|com.xiaomi.xmsfkeeper|com.xiaomi.xmsfkeeper:*) return 1 ;;
     # 其余系统包一律过滤
     com.xiaomi.*|com.miui.*|com.android.*|com.google.android.*) return 0 ;;
     android|android.*) return 0 ;;
@@ -331,6 +331,55 @@ is_msg_channel() {
     *":remote"*|*":daemon"*|*":service"*) return 0 ;;
   esac
   return 1
+}
+
+# ---------- 消息通道轻量看护（M13.2） ----------
+# 问题：AMS 会在任意时刻重算并覆写进程 adj。实测 :MSF 在 daemon 两轮之间
+#       （10s）会被 AMS 写回 500，500 < lmkd medium(960)，仍可能被选中杀掉。
+# 方案：把消息通道 PID 缓存起来，sleep 分段期间只做「读 adj → 若被抬高就写回」，
+#       不扫 ps、不查 recents。开销：每段仅 N 次 /proc/<pid>/oom_score_adj 读取
+#       （N≈10~15，约 1~2ms），可忽略。
+# 缓存失效（进程重启/消失）时置空，下一段自动完整重扫。
+MSG_PIDS=""
+
+# 完整扫描并刷新消息通道 PID 缓存
+# 判定链：is_msg_channel（消息通道特征） + is_sys_pkg 过滤（系统进程不动，xmsf 例外放行）
+refresh_msg_pids() {
+  if [ ! -f "$KEEP_CONF" ]; then MSG_PIDS=""; return 0; fi
+  local nm pid out=""
+  while read -r nm pid; do
+    [ -z "$pid" ] && continue
+    is_msg_channel "$nm" || continue
+    if is_sys_pkg "$nm"; then continue; fi
+    out="$out $pid"
+  done <<EOF
+$(ps -A -o PID,NAME 2>/dev/null | awk '
+  /:/ || /com\.xiaomi\.xmsf/ || /com\.xiaomi\.xmsfkeeper/ {
+    pid = $1
+    if (pid !~ /^[0-9]+$/) next
+    n = $0
+    sub(/^[ \t]*[0-9]+[ \t]+/, "", n)
+    sub(/[ \t]+$/, "", n)
+    print n, pid
+  }')
+EOF
+  MSG_PIDS="$out"
+}
+
+# 轻量重申：只保证已缓存的消息通道 PID 维持 adj=-900
+msg_guard() {
+  [ -z "$MSG_PIDS" ] && refresh_msg_pids
+  [ -z "$MSG_PIDS" ] && return 0
+  local pid adj kept=0 stale=0
+  for pid in $MSG_PIDS; do
+    adj=$(cat /proc/$pid/oom_score_adj 2>/dev/null)
+    if [ -z "$adj" ]; then stale=1; continue; fi
+    if [ "$adj" -gt -900 ] 2>/dev/null; then
+      echo -900 > /proc/$pid/oom_score_adj 2>/dev/null && kept=$((kept+1))
+    fi
+  done
+  [ "$stale" = "1" ] && refresh_msg_pids
+  return 0
 }
 
 # 智能保活：按 recents 状态动态设置/撤销 adj=-900
