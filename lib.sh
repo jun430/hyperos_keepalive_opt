@@ -76,9 +76,10 @@ DEF_poll_game=3
 DEF_freezer_enable=1
 DEF_max_cached_procs=64
 DEF_reclaim_mb=64
+DEF_smart_keep=1
 
 # 配置项名列表（用于 get_conf 兜底）
-CONF_KEYS="disable_mimd disable_unfairmem disable_mi_reclaim disable_memory_standard lmk_low lmk_medium lmk_critical watermark_target watermark_hysteresis drop_level game_mode game_kill_cached game_drop_caches zram_takeover swappiness poll_normal poll_game freezer_enable max_cached_procs reclaim_mb watermark_scale_factor"
+CONF_KEYS="disable_mimd disable_unfairmem disable_mi_reclaim disable_memory_standard lmk_low lmk_medium lmk_critical watermark_target watermark_hysteresis drop_level game_mode game_kill_cached game_drop_caches zram_takeover swappiness poll_normal poll_game freezer_enable max_cached_procs reclaim_mb watermark_scale_factor smart_keep"
 
 # ---------- 配置读取 ----------
 # get_conf key  -> 返回配置值（优先 hkom.conf，缺失用默认）
@@ -223,31 +224,116 @@ apply_keep_list() {
   log KEEP "已更新后台保活白名单"
 }
 
-# 内核级保活（M12）：把保活白名单进程的 oom_score_adj 强制设为 -900
+# ---------- 智能保活（M13）：按"是否在最近任务"动态决定保护 ----------
+# 设计目标：用户在最近任务里划掉某个 App → 自动移出保活；重新打开 → 自动恢复保活。
 #
-# 原理：oom_score_adj 是内核 oom killer 与 lmkd 共同读取的判定依据，
-#       值越小越不可能被杀。-900 已低于 SystemUI 的 -800，属系统进程级保护；
-#       而 lmkd 三档阈值最低是 critical（本机 930），-900 永远不会被任何一档选中。
-#       因此这些进程不会被 LMK「清理缓存」时连带杀掉，只会正常释放其页缓存。
+# 判定依据：dumpsys activity recents 能列出所有仍在最近任务中的任务。
+#   - App 进程存在 且 在 recents 中  → 保活（adj=-900）
+#   - App 进程存在 但 不在 recents    → 用户已划掉 → 撤销保护（恢复系统默认 adj）
+#   - App 在保活白名单 且 用户重新打开 → 下一轮自动重新保护
 #
-# 实测（2026-10-25）：root 可写负数 adj，写入 -900 成功并立即生效。
-#
-# 注意：adj 由 AMS 在进程状态变化时重新计算并覆写（如切前后台），
-#       所以需要在 daemon 里周期性重申，不能只设一次。
+# 为什么不监听 am_task_removed 事件：
+#   recents 列表是权威状态源，直接查它比解析事件流更可靠，
+#   也不会因为 logcat 缓冲轮转丢事件。开销：每轮 1 次 dumpsys。
+
+# 枚举白名单包对应的全部进程 PID（含 :子进程）
+# ★ 关键：不能用 pidof —— pidof 只返回「主进程」，会漏掉 :MSF / :push / :peak
+#   等子进程。实测 QQ 主进程 adj=-900 被保护，但 :MSF（消息通道）adj=800 未被
+#   保护，LMK 杀掉 :MSF 后消息链路断掉，界面回来仍要冷启动。
+#   改用单次 `ps -A -o PID,NAME` + 单次 awk 匹配「包名 或 包名:xxx」。
+# 输出：每行 "包名 PID"，供上层遍历。
+keep_pids_of() {
+  [ -f "$KEEP_CONF" ] || return 0
+  local list
+  list=$(keep_list_pkgs)
+  [ -z "$list" ] && return 0
+  ps -A -o PID,NAME 2>/dev/null | awk -v L="$list" '
+    BEGIN { n = split(L, a, " "); for (i = 1; i <= n; i++) if (a[i] != "") want[a[i]] = 1 }
+    {
+      pid = $1
+      if (pid !~ /^[0-9]+$/) next
+      name = $0
+      sub(/^[ \t]*[0-9]+[ \t]+/, "", name)
+      sub(/[ \t]+$/, "", name)
+      base = name
+      sub(/:.*/, "", base)
+      if (base in want) print base, pid
+    }'
+}
+
+# 固定保活（兼容旧行为）：无条件把白名单进程设为 adj=-900
+# smart_keep=0 时使用此函数
 harden_keep_procs() {
   [ -f "$KEEP_CONF" ] || return 0
-  local pkg pid adj cnt=0
-  for pkg in $(keep_list_pkgs); do
-    for pid in $(pidof "$pkg" 2>/dev/null); do
-      adj=$(cat /proc/$pid/oom_score_adj 2>/dev/null)
-      [ -z "$adj" ] && continue
-      # 已经是受保护级别就跳过，避免重复写
-      if [ "$adj" -gt -900 ] 2>/dev/null; then
-        echo -900 > /proc/$pid/oom_score_adj 2>/dev/null && cnt=$((cnt+1))
-      fi
-    done
-  done
-  [ "$cnt" -gt 0 ] && log KEEP "内核级保活：$cnt 个进程设为 adj=-900（LMK 不再选中）"
+  local base pid adj cnt=0
+  while read -r base pid; do
+    [ -z "$pid" ] && continue
+    adj=$(cat /proc/$pid/oom_score_adj 2>/dev/null)
+    [ -z "$adj" ] && continue
+    if [ "$adj" -gt -900 ] 2>/dev/null; then
+      echo -900 > /proc/$pid/oom_score_adj 2>/dev/null && cnt=$((cnt+1))
+    fi
+  done <<EOF
+$(keep_pids_of)
+EOF
+  [ "$cnt" -gt 0 ] && log KEEP "内核级保活：$cnt 个进程设为 adj=-900（含子进程，LMK 不再选中）"
+  return 0
+}
+
+# 取当前 recents 中的包名（去重，空格分隔）
+recents_pkgs() {
+  dumpsys activity recents 2>/dev/null \
+    | grep -oE 'A=[0-9]+:[a-zA-Z0-9_.]+' \
+    | sed 's/^A=[0-9]*://' \
+    | sort -u | tr '\n' ' '
+}
+
+# 智能保活：按 recents 状态动态设置/撤销 adj=-900
+# ★ 进程枚举走 keep_pids_of（ps+awk 单次扫描），覆盖 :MSF / :push / :peak 等子进程。
+#   pidof 只返回主进程，用它会导致子进程（消息通道）长期不受保护而被 LMK 杀掉。
+smart_keep() {
+  [ -f "$KEEP_CONF" ] || return 0
+  # 关闭智能模式时退回「全部固定保护」
+  if [ "$(get_conf smart_keep)" != "1" ]; then
+    harden_keep_procs
+    return 0
+  fi
+
+  local recents
+  recents=$(recents_pkgs)
+  local pids
+  pids=$(keep_pids_of)
+  [ -z "$pids" ] && return 0
+
+  local base pid adj prot=0 unprot=0 cname revadj
+  while read -r base pid; do
+    [ -z "$pid" ] && continue
+    adj=$(cat /proc/$pid/oom_score_adj 2>/dev/null)
+    [ -z "$adj" ] && continue
+    case " $recents " in
+      *" $base "*)
+        # 该包在最近任务中 → 保活（主进程 + 全部子进程都设 adj=-900）
+        if [ "$adj" -gt -900 ] 2>/dev/null; then
+          echo -900 > /proc/$pid/oom_score_adj 2>/dev/null && prot=$((prot+1))
+        fi
+        ;;
+      *)
+        # 该包已被划出最近任务 → 撤销保护，交回系统默认
+        # 主进程回 400（缓存级）；:子进程回 800（服务级），避免消息通道被降到过低档位
+        if [ "$adj" -le -900 ] 2>/dev/null; then
+          cname=$(tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null)
+          revadj=400
+          case "$cname" in *:*) revadj=800 ;; esac
+          echo "$revadj" > /proc/$pid/oom_score_adj 2>/dev/null && unprot=$((unprot+1))
+        fi
+        ;;
+    esac
+  done <<EOF
+$pids
+EOF
+  # 只在有变化时打日志，避免刷屏
+  [ "$prot" -gt 0 ] && log KEEP "智能保活：$prot 个进程保护中（在最近任务，含子进程）"
+  [ "$unprot" -gt 0 ] && log KEEP "智能保活：$unprot 个进程撤销保护（已划出最近任务）"
   return 0
 }
 
