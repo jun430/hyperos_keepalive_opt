@@ -169,10 +169,32 @@ psi_avg300() {
 # ---------- 后台保活白名单（M10：locked_apps 锁后台） ----------
 KEEP_CONF=$HKOM_DIR/keep.conf
 
+# 判断是否系统应用包名（系统包一律不参与本模块的 adj 保活）
+# 原则：只动第三方 App + 推送通道，其余系统服务 adj 由 AMS 统一管理，模块不干预。
+# 例外：小米推送 com.xiaomi.xmsf / com.xiaomi.xmsfkeeper 是全局消息通道，
+#       所有第三方 App 的离线推送都经它投递，允许纳入内核级保护。
+is_sys_pkg() {
+  case "$1" in
+    # 推送通道例外（允许保护）
+    com.xiaomi.xmsf|com.xiaomi.xmsfkeeper) return 1 ;;
+    # 其余系统包一律过滤
+    com.xiaomi.*|com.miui.*|com.android.*|com.google.android.*) return 0 ;;
+    android|android.*) return 0 ;;
+    com.mi.*|miui.*|com.qualcomm.*|com.qti.*) return 0 ;;
+  esac
+  return 1
+}
+
 # 读取 keep.conf 所有包名（空格分隔，供 JSON 拼接）
+# ★ 内置系统包过滤：即使配置里误加系统包，也不会进入保活处理链。
 keep_list_pkgs() {
   [ -f "$KEEP_CONF" ] || return 0
-  grep -E '^[A-Za-z]' "$KEEP_CONF" 2>/dev/null | tr '\n' ' '
+  local l out=""
+  for l in $(grep -E '^[A-Za-z]' "$KEEP_CONF" 2>/dev/null); do
+    if is_sys_pkg "$l"; then continue; fi
+    out="$out $l"
+  done
+  echo "$out"
 }
 
 # 应用保活白名单 → 系统 locked_apps
@@ -288,9 +310,36 @@ recents_pkgs() {
     | sort -u | tr '\n' ' '
 }
 
+# 判断是否为「消息推送通道」进程（必须永不撤销保护）
+# 依据真实进程名匹配，覆盖常见 IM / 推送框架：
+#   QQ      :MSF（消息服务框架）、:peak、:openSdk、:qzone
+#   微信    :push、:appbrand0/1/2、:exdevice、:service、:tools、:sandbox
+#   通用    :push、:remote、:msf、:daemon、:xmsf、:mipush、:pushservice
+# 这些进程一旦被杀，即使主进程还活着也收不到消息，因此不参与撤销。
+is_msg_channel() {
+  case "$1" in
+    # 小米推送（系统级统一推送通道，主进程与子进程全部纳入）
+    com.xiaomi.xmsf|com.xiaomi.xmsf:*|com.xiaomi.xmsfkeeper*) return 0 ;;
+    com.xiaomi.mipush*|*":mipush"*) return 0 ;;
+    # QQ
+    *":MSF"*|*":peak"*|*":openSdk"*|*":qzone"*) return 0 ;;
+    # 微信 / 通用推送
+    *":push"*|*":PushService"*|*":pushservice"*) return 0 ;;
+    *":appbrand"*) return 0 ;;
+    *":exdevice"*|*":sandbox"*|*":tools"*) return 0 ;;
+    *":msf"*|*":xmsf"*) return 0 ;;
+    *":remote"*|*":daemon"*|*":service"*) return 0 ;;
+  esac
+  return 1
+}
+
 # 智能保活：按 recents 状态动态设置/撤销 adj=-900
 # ★ 进程枚举走 keep_pids_of（ps+awk 单次扫描），覆盖 :MSF / :push / :peak 等子进程。
 #   pidof 只返回主进程，用它会导致子进程（消息通道）长期不受保护而被 LMK 杀掉。
+# ★ 撤销策略（M13.1）：
+#   主进程              → 划掉后撤销，回 400（缓存级，可被回收）
+#   消息通道子进程      → 永不撤销，始终保持 -900（收消息不能断）
+#   其它普通子进程      → 划掉后回 800（服务级，可回收但不优先杀）
 smart_keep() {
   [ -f "$KEEP_CONF" ] || return 0
   # 关闭智能模式时退回「全部固定保护」
@@ -305,23 +354,32 @@ smart_keep() {
   pids=$(keep_pids_of)
   [ -z "$pids" ] && return 0
 
-  local base pid adj prot=0 unprot=0 cname revadj
+  local base pid adj prot=0 unprot=0 keepch=0 cname revadj
   while read -r base pid; do
     [ -z "$pid" ] && continue
     adj=$(cat /proc/$pid/oom_score_adj 2>/dev/null)
     [ -z "$adj" ] && continue
+    cname=$(tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null)
+
+    if is_msg_channel "$cname"; then
+      # 消息通道：无论是否在最近任务，始终锁死 -900
+      if [ "$adj" -gt -900 ] 2>/dev/null; then
+        echo -900 > /proc/$pid/oom_score_adj 2>/dev/null && keepch=$((keepch+1))
+      fi
+      continue
+    fi
+
     case " $recents " in
       *" $base "*)
-        # 该包在最近任务中 → 保活（主进程 + 全部子进程都设 adj=-900）
+        # 该包在最近任务中 → 保活（主进程 + 普通子进程都设 adj=-900）
         if [ "$adj" -gt -900 ] 2>/dev/null; then
           echo -900 > /proc/$pid/oom_score_adj 2>/dev/null && prot=$((prot+1))
         fi
         ;;
       *)
-        # 该包已被划出最近任务 → 撤销保护，交回系统默认
-        # 主进程回 400（缓存级）；:子进程回 800（服务级），避免消息通道被降到过低档位
+        # 已划出最近任务 → 撤销保护，交回系统
+        # 主进程回 400（缓存级）；普通子进程回 800（服务级）
         if [ "$adj" -le -900 ] 2>/dev/null; then
-          cname=$(tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null)
           revadj=400
           case "$cname" in *:*) revadj=800 ;; esac
           echo "$revadj" > /proc/$pid/oom_score_adj 2>/dev/null && unprot=$((unprot+1))
@@ -332,7 +390,8 @@ smart_keep() {
 $pids
 EOF
   # 只在有变化时打日志，避免刷屏
-  [ "$prot" -gt 0 ] && log KEEP "智能保活：$prot 个进程保护中（在最近任务，含子进程）"
+  [ "$keepch" -gt 0 ] && log KEEP "消息通道保活：$keepch 个推送通道常驻 adj=-900（不收不到消息）"
+  [ "$prot" -gt 0 ] && log KEEP "智能保活：$prot 个进程保护中（在最近任务）"
   [ "$unprot" -gt 0 ] && log KEEP "智能保活：$unprot 个进程撤销保护（已划出最近任务）"
   return 0
 }
